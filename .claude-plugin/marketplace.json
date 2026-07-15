@@ -1,0 +1,21 @@
+{
+  "name": "claude-plugins",
+  "owner": {
+    "name": "Sasan Sotoodehfar",
+    "url": "https://github.com/cavi-ai"
+  },
+  "metadata": {
+    "description": "CAVI's Claude Code plugins — add this one marketplace to discover and install them all.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "claude-obsidian",
+      "source": {
+        "source": "github",
+        "repo": "cavi-ai/claude-obsidian-plugin"
+      },
+      "description": "Cowork with Claude in your Obsidian vault: synthesize notes, tag and link the graph, draft from outlines, capture sessions as notes, build HTML artifacts, run spec-based builds, and get manifest-* advisor roadmaps — all via the Companion for Claude MCP bridge."
+    }
+  ]
+}
