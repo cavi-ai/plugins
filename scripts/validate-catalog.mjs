@@ -32,13 +32,14 @@ const PROJECTIONS = {
   gemini: "providers/gemini/catalog.json",
   opencode: "providers/opencode/catalog.json"
 };
+const JSON_FAILURE = Symbol("JSON_FAILURE");
 
 async function json(root, relative, errors) {
   try {
     return JSON.parse(await readFile(path.join(root, relative), "utf8"));
   } catch (error) {
     errors.push(`${relative}: ${error instanceof SyntaxError ? "invalid JSON" : "missing file"}`);
-    return null;
+    return JSON_FAILURE;
   }
 }
 
@@ -119,6 +120,24 @@ function validateCanonicalSchema(schema, catalog, errors) {
       if (!Object.hasOwn(pkg, "path")) violation(`${location}.packages.${host}.path`, "is required");
       else if (typeof pkg.path !== "string" || pkg.path.length < 1) violation(`${location}.packages.${host}.path`, "must be a non-empty string");
     }
+  }
+}
+
+function validateTrustedIntegrity(registry, errors) {
+  if (!registry || typeof registry !== "object" || Array.isArray(registry)) {
+    errors.push("trusted integrity registry must be an object");
+    return;
+  }
+  for (const name of Object.keys(registry)) if (!REQUIRED.includes(name)) errors.push(`trusted integrity registry unexpected package: ${name}`);
+  for (const name of REQUIRED) {
+    if (!Object.hasOwn(registry, name)) { errors.push(`trusted integrity registry missing package: ${name}`); continue; }
+    const record = registry[name];
+    if (!record || typeof record !== "object" || Array.isArray(record)) { errors.push(`trusted integrity ${name} must be an object`); continue; }
+    for (const key of unknownKeys(record, ["repository", "source_commit", "source_path", "tree"])) errors.push(`trusted integrity ${name} unexpected property: ${key}`);
+    if (record.repository !== `cavi-ai/${name}`) errors.push(`trusted integrity ${name} repository mismatch`);
+    if (record.source_commit !== SOURCE_COMMITS[name]) errors.push(`trusted integrity ${name} source_commit mismatch`);
+    if (record.source_path !== SOURCE_PATHS[name]) errors.push(`trusted integrity ${name} source_path mismatch`);
+    if (typeof record.tree !== "string" || !/^[0-9a-f]{64}$/.test(record.tree)) errors.push(`trusted integrity ${name} tree must be 64 lowercase hexadecimal characters`);
   }
 }
 
@@ -206,8 +225,11 @@ export async function validateCatalog(root = process.cwd()) {
   const catalog = await json(root, "catalog.json", errors);
   const schema = await json(root, "catalog.schema.json", errors);
   const trustedIntegrity = await json(root, "packages/codex/expected-integrity.json", errors);
-  if (!catalog) return errors.sort();
-  validateCanonicalSchema(schema, catalog, errors);
+  if (trustedIntegrity !== JSON_FAILURE) validateTrustedIntegrity(trustedIntegrity, errors);
+  const trustedRegistry = trustedIntegrity === JSON_FAILURE ? null : trustedIntegrity;
+  if (catalog === JSON_FAILURE) return errors.sort();
+  validateCanonicalSchema(schema === JSON_FAILURE ? null : schema, catalog, errors);
+  if (!catalog || typeof catalog !== "object" || Array.isArray(catalog)) return errors.sort();
 
   if (catalog.name !== "plugins") errors.push("catalog name must be plugins");
   if (!Array.isArray(catalog.plugins)) {
@@ -249,7 +271,8 @@ export async function validateCatalog(root = process.cwd()) {
 
   for (const [host, relative] of Object.entries(PROJECTIONS)) {
     const projection = await json(root, relative, errors);
-    if (!projection) continue;
+    if (projection === JSON_FAILURE) continue;
+    if (!projection || typeof projection !== "object" || Array.isArray(projection)) { errors.push(`${host} projection must be an object`); continue; }
     if (projection.name !== "plugins") errors.push(`${host} projection name must be plugins`);
     if (host === "claude" || host === "codex") validateNativeProjection(host, projection, errors);
     if (host === "gemini" || host === "opencode") {
@@ -275,7 +298,7 @@ export async function validateCatalog(root = process.cwd()) {
         continue;
       }
       if (host === "codex" && raw?.source) {
-        await validateCodexPackage(root, raw, canonical, trustedIntegrity?.[raw.name], errors);
+        await validateCodexPackage(root, raw, canonical, trustedRegistry?.[raw.name], errors);
         entry.repository = canonical.repository;
         entry.package = raw.source.path?.replace(/^\.\//, "");
       }

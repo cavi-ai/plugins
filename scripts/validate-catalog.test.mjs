@@ -307,6 +307,36 @@ test("enforces fixed schema object, array, required, enum, and additional-proper
   }
 });
 
+test("never short-circuits successfully parsed falsy catalog roots", async () => {
+  for (const catalog of [null, false, 0, "", []]) {
+    const errors = await validateCatalog(await fixture({ catalog }));
+    assert(errors.some((error) => error.includes("catalog schema violation: root must be an object")), `accepted catalog root ${JSON.stringify(catalog)}\n${errors.join("\n")}`);
+  }
+});
+
+test("requires a closed and fully typed trusted-integrity registry", async () => {
+  const cases = [
+    [null, "trusted integrity registry must be an object"],
+    [{}, "trusted integrity registry missing package: mlx-agent"],
+    [(registry) => { registry.ghost = structuredClone(registry["mlx-agent"]); }, "trusted integrity registry unexpected package: ghost"],
+    [(registry) => { delete registry["obsidian-agent"]; }, "trusted integrity registry missing package: obsidian-agent"],
+    [(registry) => { registry["mlx-agent"].extra = true; }, "trusted integrity mlx-agent unexpected property: extra"],
+    [(registry) => { delete registry["mlx-agent"].source_path; }, "trusted integrity mlx-agent source_path mismatch"],
+    [(registry) => { registry["obsidian-agent"].tree = "A".repeat(64); }, "trusted integrity obsidian-agent tree must be 64 lowercase hexadecimal characters"],
+    [(registry) => { registry["obsidian-agent"].tree = "0".repeat(63); }, "trusted integrity obsidian-agent tree must be 64 lowercase hexadecimal characters"]
+  ];
+  for (const [mutateOrValue, expected] of cases) {
+    const root = await fixture({ catalog: canonical });
+    const registryPath = path.join(root, "packages/codex/expected-integrity.json");
+    let registry = JSON.parse(await readFile(registryPath, "utf8"));
+    if (typeof mutateOrValue === "function") mutateOrValue(registry);
+    else registry = mutateOrValue;
+    await writeFile(registryPath, JSON.stringify(registry));
+    const errors = await validateCatalog(root);
+    assert(errors.some((error) => error.includes(expected)), `missing ${expected}\n${errors.join("\n")}`);
+  }
+});
+
 test("rejects cross-plugin discovery command drift", async () => {
   const root = await fixture({ catalog: canonical, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [{ ...entry("mlx-agent", "gemini"), install: { command: "gemini extensions install https://github.com/cavi-ai/obsidian-agent" } }, entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
   const errors = await validateCatalog(root);
