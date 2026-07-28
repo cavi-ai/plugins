@@ -82,12 +82,43 @@ function unknownKeys(value, allowed) {
 
 function validateCanonicalSchema(schema, catalog, errors) {
   if (schema?.$schema !== "https://json-schema.org/draft/2020-12/schema" || schema?.$id !== "https://github.com/cavi-ai/plugins/catalog.schema.json" || schema?.type !== "object" || schema?.additionalProperties !== false || schema?.properties?.name?.const !== "plugins" || schema?.properties?.plugins?.minItems !== 2 || schema?.properties?.plugins?.maxItems !== 2 || schema?.$defs?.plugin?.additionalProperties !== false || JSON.stringify(schema?.$defs?.host?.enum) !== JSON.stringify(HOSTS)) errors.push("catalog schema contract invalid");
+  const violation = (location, message) => errors.push(`catalog schema violation: ${location} ${message}`);
+  if (!catalog || typeof catalog !== "object" || Array.isArray(catalog)) { violation("root", "must be an object"); return; }
   if (catalog.$schema !== "./catalog.schema.json") errors.push("catalog schema reference invalid");
   for (const key of unknownKeys(catalog, ["$schema", "name", "plugins"])) errors.push(`catalog unknown property: ${key}`);
-  for (const plugin of catalog.plugins ?? []) {
+  if (Object.hasOwn(catalog, "$schema") && typeof catalog.$schema !== "string") violation("$schema", "must be a string");
+  if (!Object.hasOwn(catalog, "name")) violation("name", "is required");
+  else if (catalog.name !== "plugins") violation("name", "must equal plugins");
+  if (!Object.hasOwn(catalog, "plugins")) violation("plugins", "is required");
+  else if (!Array.isArray(catalog.plugins)) violation("plugins", "must be an array");
+  else if (catalog.plugins.length !== 2) violation("plugins", "must contain exactly 2 items");
+  for (const [index, plugin] of (Array.isArray(catalog.plugins) ? catalog.plugins : []).entries()) {
+    const location = `plugins[${index}]`;
+    if (!plugin || typeof plugin !== "object" || Array.isArray(plugin)) { violation(location, "must be an object"); continue; }
     for (const key of unknownKeys(plugin, ["name", "repository", "license", "summary", "hosts", "packages"])) errors.push(`catalog plugin ${plugin?.name} unknown property: ${key}`);
-    for (const key of unknownKeys(plugin?.packages, HOSTS)) errors.push(`catalog plugin ${plugin?.name} unknown package host: ${key}`);
-    for (const [host, pkg] of Object.entries(plugin?.packages ?? {})) for (const key of unknownKeys(pkg, ["path"])) errors.push(`catalog plugin ${plugin?.name} ${host} package unknown property: ${key}`);
+    for (const key of ["name", "repository", "license", "summary", "hosts", "packages"]) if (!Object.hasOwn(plugin, key)) violation(`${location}.${key}`, "is required");
+    if (Object.hasOwn(plugin, "name") && !REQUIRED.includes(plugin.name)) violation(`${location}.name`, "must be a canonical plugin name");
+    if (Object.hasOwn(plugin, "repository") && (typeof plugin.repository !== "string" || !/^cavi-ai\/[a-z0-9-]+$/.test(plugin.repository))) violation(`${location}.repository`, "must match ^cavi-ai/[a-z0-9-]+$");
+    for (const key of ["license", "summary"]) if (Object.hasOwn(plugin, key) && (typeof plugin[key] !== "string" || plugin[key].length < 1)) violation(`${location}.${key}`, "must be a non-empty string");
+    if (Object.hasOwn(plugin, "hosts")) {
+      if (!Array.isArray(plugin.hosts)) violation(`${location}.hosts`, "must be an array");
+      else {
+        if (plugin.hosts.length !== 5) violation(`${location}.hosts`, "must contain exactly 5 items");
+        if (new Set(plugin.hosts.map((host) => JSON.stringify(host))).size !== plugin.hosts.length) violation(`${location}.hosts`, "must contain unique items");
+        plugin.hosts.forEach((host, hostIndex) => { if (!HOSTS.includes(host)) violation(`${location}.hosts[${hostIndex}]`, "must be a supported host"); });
+      }
+    }
+    if (!Object.hasOwn(plugin, "packages")) continue;
+    if (!plugin.packages || typeof plugin.packages !== "object" || Array.isArray(plugin.packages)) { violation(`${location}.packages`, "must be an object"); continue; }
+    for (const key of unknownKeys(plugin.packages, HOSTS)) errors.push(`catalog plugin ${plugin?.name} unknown package host: ${key}`);
+    for (const host of HOSTS) {
+      if (!Object.hasOwn(plugin.packages, host)) { violation(`${location}.packages.${host}`, "is required"); continue; }
+      const pkg = plugin.packages[host];
+      if (!pkg || typeof pkg !== "object" || Array.isArray(pkg)) { violation(`${location}.packages.${host}`, "must be an object"); continue; }
+      for (const key of unknownKeys(pkg, ["path"])) errors.push(`catalog plugin ${plugin?.name} ${host} package unknown property: ${key}`);
+      if (!Object.hasOwn(pkg, "path")) violation(`${location}.packages.${host}.path`, "is required");
+      else if (typeof pkg.path !== "string" || pkg.path.length < 1) violation(`${location}.packages.${host}.path`, "must be a non-empty string");
+    }
   }
 }
 
@@ -109,12 +140,17 @@ function validateNativeProjection(host, projection, errors) {
   }
 }
 
-async function validateCodexPackage(root, raw, canonical, errors) {
+async function validateCodexPackage(root, raw, canonical, trustedIntegrity, errors) {
   if (raw?.source?.source !== "local") {
     errors.push(`codex source must be marketplace-local: ${raw?.name}`);
     return;
   }
-  const expected = `./${canonical.packages.codex.path}`;
+  const codexPath = canonical.packages?.codex?.path;
+  if (typeof codexPath !== "string" || !codexPath) {
+    errors.push(`codex package path invalid: ${raw?.name}`);
+    return;
+  }
+  const expected = `./${codexPath}`;
   if (raw.source.path !== expected) errors.push(`codex local source mismatch: ${raw.name}`);
   const packageRoot = path.resolve(root, raw.source.path);
   if (!packageRoot.startsWith(`${path.resolve(root)}${path.sep}`)) {
@@ -143,10 +179,13 @@ async function validateCodexPackage(root, raw, canonical, errors) {
     if (unknownKeys(provenance, provenanceKeys).length || unknownKeys(provenance.integrity, ["algorithm", "tree"]).length) errors.push(`codex package provenance shape invalid: ${raw.name}`);
     if (raw.name === "mlx-agent" && (JSON.stringify(provenance.excluded) !== JSON.stringify(MLX_EXCLUDED) || provenance.exclusion_reason !== MLX_EXCLUSION_REASON)) errors.push("codex package exclusions mismatch: mlx-agent");
     if (JSON.stringify(provenance.included) !== JSON.stringify(INCLUDED_ROOTS)) errors.push(`codex package included roots mismatch: ${raw.name}`);
+    if (!trustedIntegrity || trustedIntegrity.repository !== canonical.repository || trustedIntegrity.source_commit !== SOURCE_COMMITS[raw.name] || trustedIntegrity.source_path !== SOURCE_PATHS[raw.name] || typeof trustedIntegrity.tree !== "string") errors.push(`codex package trusted integrity invalid: ${raw.name}`);
     if (provenance.integrity?.algorithm !== "sha256" || !Array.isArray(provenance.included)) {
       errors.push(`codex package integrity metadata invalid: ${raw.name}`);
-    } else if (symlinks.length === 0 && nonregular.length === 0 && await packageTreeHash(packageRoot, INCLUDED_ROOTS) !== provenance.integrity.tree) {
-      errors.push(`codex package integrity mismatch: ${raw.name}`);
+    } else if (symlinks.length === 0 && nonregular.length === 0) {
+      const actualTree = await packageTreeHash(packageRoot, INCLUDED_ROOTS);
+      if (actualTree !== provenance.integrity.tree) errors.push(`codex package integrity mismatch: ${raw.name}`);
+      if (actualTree !== trustedIntegrity?.tree) errors.push(`codex package upstream digest mismatch: ${raw.name}`);
     }
     const allowedTop = new Set([".codex-plugin", "skills", "provenance.json"]);
     for (const item of await readdir(packageRoot)) if (!allowedTop.has(item)) errors.push(`codex package unexpected root entry: ${raw.name}: ${item}`);
@@ -166,6 +205,7 @@ export async function validateCatalog(root = process.cwd()) {
   const errors = [];
   const catalog = await json(root, "catalog.json", errors);
   const schema = await json(root, "catalog.schema.json", errors);
+  const trustedIntegrity = await json(root, "packages/codex/expected-integrity.json", errors);
   if (!catalog) return errors.sort();
   validateCanonicalSchema(schema, catalog, errors);
 
@@ -235,7 +275,7 @@ export async function validateCatalog(root = process.cwd()) {
         continue;
       }
       if (host === "codex" && raw?.source) {
-        await validateCodexPackage(root, raw, canonical, errors);
+        await validateCodexPackage(root, raw, canonical, trustedIntegrity?.[raw.name], errors);
         entry.repository = canonical.repository;
         entry.package = raw.source.path?.replace(/^\.\//, "");
       }

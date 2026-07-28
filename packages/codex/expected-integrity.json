@@ -1,0 +1,14 @@
+{
+  "mlx-agent": {
+    "repository": "cavi-ai/mlx-agent",
+    "source_commit": "923627988cf98e984fa36e0b940f86e7263e2958",
+    "source_path": "providers/codex",
+    "tree": "c3fd7577d32e4c179d510516117a2405f80dd67e5693fd7b9835d6b84ed62d3c"
+  },
+  "obsidian-agent": {
+    "repository": "cavi-ai/obsidian-agent",
+    "source_commit": "7efecb058fce8185056cbe7868d6de1af11879a9",
+    "source_path": ".",
+    "tree": "e4b9ecdc9d7d76011d955784f64d2b2f2074e5c776b5411d9fc332dd07734df2"
+  }
+}

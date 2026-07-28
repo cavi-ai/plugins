@@ -60,6 +60,12 @@ async function fixture({ catalog, claude = [], codex = [], gemini = [], opencode
   await writeFile(path.join(root, "providers/gemini/catalog.json"), JSON.stringify({ name: "plugins", host: "gemini", protocol: "discovery", plugins: gemini }));
   await writeFile(path.join(root, "providers/opencode/catalog.json"), JSON.stringify({ name: "plugins", host: "opencode", protocol: "discovery", plugins: opencode }));
   for (const name of Object.keys(inventories)) await createFixturePackage(root, name);
+  const expectedIntegrity = {};
+  for (const name of Object.keys(inventories)) {
+    const provenance = JSON.parse(await readFile(path.join(root, `packages/codex/${name}/provenance.json`), "utf8"));
+    expectedIntegrity[name] = { repository: provenance.repository, source_commit: provenance.source_commit, source_path: provenance.source_path, tree: provenance.integrity.tree };
+  }
+  await writeFile(path.join(root, "packages/codex/expected-integrity.json"), JSON.stringify(expectedIntegrity));
   return root;
 }
 
@@ -208,6 +214,18 @@ test("rejects drift inside a pinned Codex package", async () => {
   assert(errors.some((error) => error.includes("codex package integrity mismatch: obsidian-agent")));
 });
 
+test("rejects vendored drift even when package-local provenance is recomputed", async () => {
+  const root = await fixture({ catalog: canonical, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
+  const packageRoot = path.join(root, "packages/codex/obsidian-agent");
+  await writeFile(path.join(packageRoot, "skills/vault-grounding/SKILL.md"), "---\nname: vault-grounding\ndescription: attacker content\n---\n");
+  const provenancePath = path.join(packageRoot, "provenance.json");
+  const provenance = JSON.parse(await readFile(provenancePath, "utf8"));
+  provenance.integrity.tree = await fixtureTreeHash(packageRoot);
+  await writeFile(provenancePath, JSON.stringify(provenance));
+  const errors = await validateCatalog(root);
+  assert(errors.some((error) => error.includes("codex package upstream digest mismatch: obsidian-agent")));
+});
+
 test("rejects self-selected integrity roots and missing authoritative skills", async () => {
   const root = await fixture({ catalog: canonical, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
   const packageRoot = path.join(root, "packages/codex/obsidian-agent");
@@ -258,6 +276,35 @@ test("applies canonical schema and rejects malformed native projections", async 
   const errors = await validateCatalog(root);
   assert(errors.some((error) => error.includes("catalog unknown property: unexpected")));
   assert(errors.some((error) => error.includes("claude native source invalid: mlx-agent")));
+});
+
+test("applies every nested catalog package schema type", async () => {
+  const badCatalog = structuredClone(canonical);
+  badCatalog.plugins[0].packages.agentskills.path = 42;
+  const errors = await validateCatalog(await fixture({ catalog: badCatalog }));
+  assert(errors.some((error) => error.includes("catalog schema violation: plugins[0].packages.agentskills.path must be a non-empty string")));
+});
+
+test("enforces fixed schema object, array, required, enum, and additional-properties constraints", async () => {
+  const cases = [
+    [(catalog) => { catalog.extra = true; }, "catalog unknown property: extra"],
+    [(catalog) => { catalog.plugins[0] = []; }, "catalog schema violation: plugins[0] must be an object"],
+    [(catalog) => { delete catalog.plugins[0].license; }, "catalog schema violation: plugins[0].license is required"],
+    [(catalog) => { catalog.plugins[0].name = "other"; }, "catalog schema violation: plugins[0].name must be a canonical plugin name"],
+    [(catalog) => { catalog.plugins[0].hosts = "claude"; }, "catalog schema violation: plugins[0].hosts must be an array"],
+    [(catalog) => { catalog.plugins[0].hosts[4] = "claude"; }, "catalog schema violation: plugins[0].hosts must contain unique items"],
+    [(catalog) => { catalog.plugins[0].packages = []; }, "catalog schema violation: plugins[0].packages must be an object"],
+    [(catalog) => { delete catalog.plugins[0].packages.codex; }, "catalog schema violation: plugins[0].packages.codex is required"],
+    [(catalog) => { catalog.plugins[0].packages.codex = "local"; }, "catalog schema violation: plugins[0].packages.codex must be an object"],
+    [(catalog) => { catalog.plugins[0].packages.codex.extra = true; }, "catalog plugin mlx-agent codex package unknown property: extra"],
+    [(catalog) => { catalog.plugins[0].packages.codex.path = ""; }, "catalog schema violation: plugins[0].packages.codex.path must be a non-empty string"]
+  ];
+  for (const [mutate, expected] of cases) {
+    const badCatalog = structuredClone(canonical);
+    mutate(badCatalog);
+    const errors = await validateCatalog(await fixture({ catalog: badCatalog }));
+    assert(errors.some((error) => error.includes(expected)), `missing ${expected}\n${errors.join("\n")}`);
+  }
 });
 
 test("rejects cross-plugin discovery command drift", async () => {
