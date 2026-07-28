@@ -31,7 +31,9 @@ codex plugin add mlx-agent@plugins
 codex plugin add obsidian-agent@plugins
 ```
 
-The Codex projection at [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json) points to each repository's published Codex package.
+The Codex projection at [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json) uses Codex's documented marketplace-local source layout. `packages/codex/` contains minimal, self-contained projections copied from exact upstream commits. Each package includes provenance and a deterministic tree hash; catalog validation rejects local drift.
+
+These package projections are distribution artifacts, not independent workflow sources. Refresh one only from a reviewed upstream commit, update its `provenance.json`, and run the full catalog gate. Product development remains in the linked plugin repository.
 
 ## Gemini CLI
 

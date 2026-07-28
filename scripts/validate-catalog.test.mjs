@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -146,4 +146,33 @@ test("requires explicit install commands in discovery projections", async () => 
   const errors = await validateCatalog(root);
   assert(errors.some((error) => error.includes("gemini install command missing: mlx-agent")));
   assert(errors.some((error) => error.includes("opencode install command missing: obsidian-agent")));
+});
+
+test("the published Codex projection uses resolvable marketplace-local packages", async () => {
+  const root = path.resolve(new URL("..", import.meta.url).pathname);
+  const projection = JSON.parse(await readFile(path.join(root, ".agents/plugins/marketplace.json"), "utf8"));
+  for (const plugin of projection.plugins) {
+    assert.equal(plugin.source.source, "local");
+    assert.match(plugin.source.path, /^\.\/packages\/codex\/[a-z0-9-]+$/);
+    const packageRoot = path.resolve(root, plugin.source.path);
+    assert.equal((await stat(packageRoot)).isDirectory(), true);
+    const manifest = JSON.parse(await readFile(path.join(packageRoot, ".codex-plugin/plugin.json"), "utf8"));
+    assert.equal(manifest.name, plugin.name);
+  }
+});
+
+test("rejects drift inside a pinned Codex package", async () => {
+  const sourceRoot = path.resolve(new URL("..", import.meta.url).pathname);
+  const root = await fixture({
+    catalog: canonical,
+    claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")],
+    codex: [entry("mlx-agent", "codex"), { name: "obsidian-agent", source: { source: "local", path: "./packages/codex/obsidian-agent" } }],
+    gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")],
+    opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")]
+  });
+  await mkdir(path.join(root, "packages/codex"), { recursive: true });
+  await cp(path.join(sourceRoot, "packages/codex/obsidian-agent"), path.join(root, "packages/codex/obsidian-agent"), { recursive: true });
+  await writeFile(path.join(root, "packages/codex/obsidian-agent/skills/vault-grounding/SKILL.md"), "tampered\n");
+  const errors = await validateCatalog(root);
+  assert(errors.some((error) => error.includes("codex package integrity mismatch: obsidian-agent")));
 });

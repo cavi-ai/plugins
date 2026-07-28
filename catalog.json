@@ -10,7 +10,7 @@
       "hosts": ["claude", "codex", "gemini", "opencode", "agentskills"],
       "packages": {
         "claude": { "path": "." },
-        "codex": { "path": "providers/codex" },
+        "codex": { "path": "packages/codex/mlx-agent" },
         "gemini": { "path": "providers/gemini" },
         "opencode": { "path": "providers/opencode" },
         "agentskills": { "path": "providers/agentskills" }
@@ -24,7 +24,7 @@
       "hosts": ["claude", "codex", "gemini", "opencode", "agentskills"],
       "packages": {
         "claude": { "path": "." },
-        "codex": { "path": "." },
+        "codex": { "path": "packages/codex/obsidian-agent" },
         "gemini": { "path": "." },
         "opencode": { "path": "providers/opencode" },
         "agentskills": { "path": "providers/agentskills" }

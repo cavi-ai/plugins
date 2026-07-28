@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -28,6 +30,63 @@ function projectionIdentity(entry) {
     repository: entry?.repository ?? entry?.source?.repo,
     package: entry?.package ?? entry?.source?.path ?? "."
   };
+}
+
+async function filesUnder(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const nested = await Promise.all(entries.map((entry) => {
+    const target = path.join(directory, entry.name);
+    return entry.isDirectory() ? filesUnder(target) : [target];
+  }));
+  return nested.flat();
+}
+
+async function packageTreeHash(packageRoot, included) {
+  const hash = createHash("sha256");
+  for (const base of included) {
+    const files = (await filesUnder(path.join(packageRoot, base))).sort();
+    for (const file of files) {
+      hash.update(path.relative(packageRoot, file));
+      hash.update("\0");
+      hash.update(await readFile(file));
+      hash.update("\0");
+    }
+  }
+  return hash.digest("hex");
+}
+
+async function validateCodexPackage(root, raw, canonical, errors) {
+  if (raw?.source?.source !== "local") {
+    errors.push(`codex source must be marketplace-local: ${raw?.name}`);
+    return;
+  }
+  const expected = `./${canonical.packages.codex.path}`;
+  if (raw.source.path !== expected) errors.push(`codex local source mismatch: ${raw.name}`);
+  const packageRoot = path.resolve(root, raw.source.path);
+  if (!packageRoot.startsWith(`${path.resolve(root)}${path.sep}`)) {
+    errors.push(`codex package escapes catalog: ${raw.name}`);
+    return;
+  }
+  try {
+    const provenance = JSON.parse(await readFile(path.join(packageRoot, "provenance.json"), "utf8"));
+    const manifest = JSON.parse(await readFile(path.join(packageRoot, ".codex-plugin/plugin.json"), "utf8"));
+    if (manifest.name !== raw.name) errors.push(`codex package manifest mismatch: ${raw.name}`);
+    if (provenance.repository !== canonical.repository) errors.push(`codex package provenance repository mismatch: ${raw.name}`);
+    if (!/^[0-9a-f]{40}$/.test(provenance.source_commit ?? "")) errors.push(`codex package source commit invalid: ${raw.name}`);
+    if (provenance.integrity?.algorithm !== "sha256" || !Array.isArray(provenance.included)) {
+      errors.push(`codex package integrity metadata invalid: ${raw.name}`);
+    } else if (await packageTreeHash(packageRoot, provenance.included) !== provenance.integrity.tree) {
+      errors.push(`codex package integrity mismatch: ${raw.name}`);
+    }
+    const packageFiles = await filesUnder(packageRoot);
+    if (!packageFiles.some((file) => /\/skills\/[^/]+\/SKILL\.md$/.test(file))) errors.push(`codex package has no skills: ${raw.name}`);
+    if (packageFiles.some((file) => path.basename(file) === ".mcp.json" || path.basename(file) === "mlx-agent-mcp" || path.basename(file) === "mcp_server.py")) {
+      errors.push(`codex package contains MCP transport: ${raw.name}`);
+    }
+    if (Object.hasOwn(manifest, "mcpServers")) errors.push(`codex package manifest contains mcpServers: ${raw.name}`);
+  } catch {
+    errors.push(`codex package is incomplete: ${raw.name}`);
+  }
 }
 
 export async function validateCatalog(root = process.cwd()) {
@@ -98,6 +157,11 @@ export async function validateCatalog(root = process.cwd()) {
       if (!canonical) {
         errors.push(`${host} projects unknown plugin: ${entry.name}`);
         continue;
+      }
+      if (host === "codex" && raw?.source) {
+        await validateCodexPackage(root, raw, canonical, errors);
+        entry.repository = canonical.repository;
+        entry.package = raw.source.path?.replace(/^\.\//, "");
       }
       if (!canonical.hosts?.includes(host)) errors.push(`${host} projects unsupported plugin host: ${entry.name}`);
       if (entry.repository !== canonical.repository) errors.push(`${host} repository mismatch: ${entry.name}`);

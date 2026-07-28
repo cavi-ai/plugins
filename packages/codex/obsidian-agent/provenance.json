@@ -1,0 +1,10 @@
+{
+  "repository": "cavi-ai/obsidian-agent",
+  "source_commit": "7efecb058fce8185056cbe7868d6de1af11879a9",
+  "source_path": ".",
+  "included": [".codex-plugin", "skills"],
+  "integrity": {
+    "algorithm": "sha256",
+    "tree": "e4b9ecdc9d7d76011d955784f64d2b2f2074e5c776b5411d9fc332dd07734df2"
+  }
+}
