@@ -1,29 +1,76 @@
-# claude-plugins
+# CAVI plugins for agent hosts
 
-CAVI's Claude Code plugin marketplace. Add it once and install any of the plugins below.
-
-```
-/plugin marketplace add cavi-ai/claude-plugins
-/plugin install <plugin-name>@claude-plugins
-```
+`cavi-ai/plugins` is CAVI's host-neutral discovery catalog for installable agent extensions. Plugin source stays in each plugin's own repository; this repository publishes one canonical catalog and validated host projections.
 
 ## Plugins
 
-| Plugin | What it does | Source |
-| --- | --- | --- |
-| **claude-obsidian** | Cowork with Claude inside your Obsidian vault — synthesize and link notes, keep tags clean, draft from outlines, capture sessions as knowledge, build self-contained HTML artifacts, drive spec-based builds, and get `manifest-*` advisor roadmaps, all over the Companion for Claude MCP bridge. | [`cavi-ai/claude-obsidian-plugin`](https://github.com/cavi-ai/claude-obsidian-plugin) |
+| Plugin | Claude | Codex | Gemini | OpenCode | AgentSkills |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| [`mlx-agent`](https://github.com/cavi-ai/mlx-agent) — discover, verify, and wire local MLX models | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [`obsidian-agent`](https://github.com/cavi-ai/obsidian-agent) — portable vault workflows over the official Obsidian CLI | ✓ | ✓ | ✓ | ✓ | ✓ |
 
-## How this catalog works
+The machine-readable source of truth is [`catalog.json`](catalog.json). Claude and Codex consume native marketplace projections. Gemini and OpenCode use the discovery records under `providers/`, which link to each source repository's tested installer; those files do not claim a native marketplace protocol. Portable AgentSkills packages remain available from each plugin repository.
 
-This repo is a **catalog**, not a container. Each entry in
-[`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json) points at wherever the
-plugin actually lives:
+## Claude Code
 
-- **Standalone plugins** live as subdirectories in this repo (relative-path `source`).
-- **Paired plugins** — shipped alongside another product (e.g. `claude-obsidian`, which pairs
-  with the Companion for Claude Obsidian plugin over an MCP bridge) — keep their own repo and
-  are referenced here via a `github` source. Each plugin's own `plugin.json` still governs its
-  version and components.
+Add the marketplace, then install either plugin:
 
-Adding a plugin to the catalog never moves its code — it just makes it discoverable from one
-`/plugin marketplace add`.
+```text
+/plugin marketplace add cavi-ai/plugins
+/plugin install mlx-agent@plugins
+/plugin install obsidian-agent@plugins
+```
+
+## Codex
+
+Add the marketplace, then install either plugin:
+
+```sh
+codex plugin marketplace add cavi-ai/plugins
+codex plugin add mlx-agent@plugins
+codex plugin add obsidian-agent@plugins
+```
+
+The Codex projection at [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json) points to each repository's published Codex package.
+
+## Gemini CLI
+
+Gemini discovery metadata is in [`providers/gemini/catalog.json`](providers/gemini/catalog.json). Each entry records the source repository's native installation command. For example:
+
+```sh
+git clone https://github.com/cavi-ai/mlx-agent.git
+gemini extensions install ./mlx-agent/providers/gemini
+
+gemini extensions install https://github.com/cavi-ai/obsidian-agent
+```
+
+Both commands use Gemini's native extension loader. The discovery catalog itself does not install anything.
+
+## OpenCode
+
+OpenCode discovery metadata is in [`providers/opencode/catalog.json`](providers/opencode/catalog.json). Both source repositories provide preview-first installers:
+
+```sh
+git clone https://github.com/cavi-ai/mlx-agent.git
+python3 mlx-agent/scripts/mlx-agent install opencode --scope user --dry-run --json
+
+git clone https://github.com/cavi-ai/obsidian-agent.git
+node obsidian-agent/scripts/install.mjs --host opencode --scope user --dry-run
+```
+
+Review the destination paths and use the exact preview hash when confirming.
+
+## AgentSkills
+
+Both plugins publish portable skills under their AgentSkills adapter. Follow the selected repository's project- or user-scope installation instructions; the catalog does not copy or fork skill content.
+
+## Validate the catalog
+
+Node.js 22 or newer is sufficient:
+
+```sh
+node --test
+node scripts/validate-catalog.mjs
+```
+
+Validation rejects identity drift, unknown or missing hosts, duplicate entries, non-plugin products, and projections that disagree with the canonical repository or package path.

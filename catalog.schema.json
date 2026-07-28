@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cavi-ai/plugins/catalog.schema.json",
+  "title": "CAVI cross-host plugin catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "plugins"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "name": { "const": "plugins" },
+    "plugins": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "$ref": "#/$defs/plugin" }
+    }
+  },
+  "$defs": {
+    "host": { "enum": ["claude", "codex", "gemini", "opencode", "agentskills"] },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": { "path": { "type": "string", "minLength": 1 } }
+    },
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "repository", "license", "summary", "hosts", "packages"],
+      "properties": {
+        "name": { "enum": ["mlx-agent", "obsidian-agent"] },
+        "repository": { "type": "string", "pattern": "^cavi-ai/[a-z0-9-]+$" },
+        "license": { "type": "string", "minLength": 1 },
+        "summary": { "type": "string", "minLength": 1 },
+        "hosts": { "type": "array", "minItems": 5, "maxItems": 5, "uniqueItems": true, "items": { "$ref": "#/$defs/host" } },
+        "packages": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["claude", "codex", "gemini", "opencode", "agentskills"],
+          "properties": {
+            "claude": { "$ref": "#/$defs/package" },
+            "codex": { "$ref": "#/$defs/package" },
+            "gemini": { "$ref": "#/$defs/package" },
+            "opencode": { "$ref": "#/$defs/package" },
+            "agentskills": { "$ref": "#/$defs/package" }
+          }
+        }
+      }
+    }
+  }
+}

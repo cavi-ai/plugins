@@ -1,0 +1,19 @@
+{
+  "name": "plugins",
+  "host": "opencode",
+  "protocol": "discovery",
+  "plugins": [
+    {
+      "name": "mlx-agent",
+      "repository": "cavi-ai/mlx-agent",
+      "package": "providers/opencode",
+      "install": { "command": "git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install opencode --scope user --dry-run --json" }
+    },
+    {
+      "name": "obsidian-agent",
+      "repository": "cavi-ai/obsidian-agent",
+      "package": "providers/opencode",
+      "install": { "command": "git clone https://github.com/cavi-ai/obsidian-agent.git && node obsidian-agent/scripts/install.mjs --host opencode --scope user --dry-run" }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "name": "plugins",
+  "host": "gemini",
+  "protocol": "discovery",
+  "plugins": [
+    {
+      "name": "mlx-agent",
+      "repository": "cavi-ai/mlx-agent",
+      "package": "providers/gemini",
+      "install": { "command": "git clone https://github.com/cavi-ai/mlx-agent.git && gemini extensions install ./mlx-agent/providers/gemini" }
+    },
+    {
+      "name": "obsidian-agent",
+      "repository": "cavi-ai/obsidian-agent",
+      "package": ".",
+      "install": { "command": "gemini extensions install https://github.com/cavi-ai/obsidian-agent" }
+    }
+  ]
+}

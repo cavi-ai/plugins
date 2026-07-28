@@ -1,0 +1,34 @@
+{
+  "$schema": "./catalog.schema.json",
+  "name": "plugins",
+  "plugins": [
+    {
+      "name": "mlx-agent",
+      "repository": "cavi-ai/mlx-agent",
+      "license": "MIT",
+      "summary": "Discover, verify, and wire local MLX-optimized models on Apple Silicon.",
+      "hosts": ["claude", "codex", "gemini", "opencode", "agentskills"],
+      "packages": {
+        "claude": { "path": "." },
+        "codex": { "path": "providers/codex" },
+        "gemini": { "path": "providers/gemini" },
+        "opencode": { "path": "providers/opencode" },
+        "agentskills": { "path": "providers/agentskills" }
+      }
+    },
+    {
+      "name": "obsidian-agent",
+      "repository": "cavi-ai/obsidian-agent",
+      "license": "MIT",
+      "summary": "Run portable, safety-gated Obsidian vault workflows through the official Obsidian CLI.",
+      "hosts": ["claude", "codex", "gemini", "opencode", "agentskills"],
+      "packages": {
+        "claude": { "path": "." },
+        "codex": { "path": "." },
+        "gemini": { "path": "." },
+        "opencode": { "path": "providers/opencode" },
+        "agentskills": { "path": "providers/agentskills" }
+      }
+    }
+  ]
+}
