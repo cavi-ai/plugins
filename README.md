@@ -8,19 +8,17 @@
 | --- | :---: | :---: | :---: | :---: | :---: |
 | [`mlx-agent`](https://github.com/cavi-ai/mlx-agent) — discover, verify, and wire local MLX models | ✓ | ✓ | ✓ | ✓ | ✓ |
 | [`obsidian-agent`](https://github.com/cavi-ai/obsidian-agent) — portable vault workflows over the official Obsidian CLI | ✓ | ✓ | ✓ | ✓ | ✓ |
-| [`harness`](https://github.com/cavi-ai/harness) — policy engine for Claude Code sessions (hard stops, intent gates, advisories, outcome contracts) | ✓ | — | — | — | — |
 
 The machine-readable source of truth is [`catalog.json`](catalog.json). Claude and Codex consume native marketplace projections. Gemini and OpenCode use the discovery records under `providers/`, which link to each source repository's tested installer; those files do not claim a native marketplace protocol. Portable AgentSkills packages remain available from each plugin repository.
 
 ## Claude Code
 
-Add the marketplace, then install any plugin:
+Add the marketplace, then install either plugin:
 
 ```text
 /plugin marketplace add cavi-ai/plugins
 /plugin install mlx-agent@cavi-ai
 /plugin install obsidian-agent@cavi-ai
-/plugin install harness@cavi-ai
 ```
 
 ## Codex

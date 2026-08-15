@@ -21,7 +21,7 @@ function plugin(name, repository = `cavi-ai/${name}`, supportedHosts = hosts) {
     license: "MIT",
     summary: `${name} summary`,
     hosts: supportedHosts,
-    packages: Object.fromEntries([...new Set(supportedHosts)].filter((host) => hosts.includes(host)).map((host) => [host, { path: host === "claude" ? "." : host === "codex" ? `packages/codex/${name}` : host === "gemini" ? (name === "mlx-agent" ? "providers/gemini" : ".") : host === "opencode" ? "providers/opencode" : "providers/agentskills" }]))
+    packages: Object.fromEntries(hosts.map((host) => [host, { path: host === "claude" ? "." : host === "codex" ? `packages/codex/${name}` : host === "gemini" ? (name === "mlx-agent" ? "providers/gemini" : ".") : host === "opencode" ? "providers/opencode" : "providers/agentskills" }]))
   };
 }
 
@@ -83,7 +83,7 @@ const entry = (name, host) => ({
   ...(host === "opencode" ? { install: { command: name === "mlx-agent" ? "git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install opencode --scope user --dry-run --json" : "git clone https://github.com/cavi-ai/obsidian-agent.git && node obsidian-agent/scripts/install.mjs --host opencode --scope user --dry-run" } } : {})
 });
 
-test("accepts the canonical plugins and truthful host projections", async () => {
+test("accepts exactly the two canonical plugins and truthful host projections", async () => {
   const root = await fixture({
     catalog: canonical,
     claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")],
@@ -92,27 +92,6 @@ test("accepts the canonical plugins and truthful host projections", async () => 
     opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")]
   });
   assert.deepEqual(await validateCatalog(root), []);
-});
-
-test("accepts a claude-only plugin projected only to claude", async () => {
-  const withHarness = { ...canonical, plugins: [...canonical.plugins, plugin("harness", "cavi-ai/harness", ["claude"])] };
-  const root = await fixture({
-    catalog: withHarness,
-    claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude"), { name: "harness", repository: "cavi-ai/harness", package: "." }],
-    codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")],
-    gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")],
-    opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")]
-  });
-  assert.deepEqual(await validateCatalog(root), []);
-  const projectedWide = await fixture({
-    catalog: withHarness,
-    claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude"), { name: "harness", repository: "cavi-ai/harness", package: "." }],
-    codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex"), { name: "harness", repository: "cavi-ai/harness", package: "packages/codex/harness" }],
-    gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")],
-    opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")]
-  });
-  const errors = await validateCatalog(projectedWide);
-  assert(errors.some((error) => error.includes("codex projects unsupported plugin host: harness")));
 });
 
 test("rejects duplicates, unknown hosts, missing repositories, and legacy identities", async () => {
@@ -166,12 +145,11 @@ test("rejects repository identity and package path mismatches", async () => {
   assert(errors.some((error) => error.includes("opencode package mismatch: obsidian-agent")));
 });
 
-test("rejects duplicate hosts, undeclared host packages, and duplicate projection entries", async () => {
+test("requires the complete host matrix without duplicate host or projection entries", async () => {
   const incomplete = {
     name: MARKETPLACE,
     plugins: [plugin("mlx-agent", "cavi-ai/mlx-agent", ["claude", "claude", "codex", "gemini", "opencode"]), plugin("obsidian-agent")]
   };
-  incomplete.plugins[0].packages.agentskills = { path: "providers/agentskills" };
   const root = await fixture({
     catalog: incomplete,
     claude: [entry("mlx-agent", "claude"), entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")],
@@ -181,7 +159,7 @@ test("rejects duplicate hosts, undeclared host packages, and duplicate projectio
   });
   const errors = await validateCatalog(root);
   assert(errors.some((error) => error.includes("duplicate host: claude")));
-  assert(errors.some((error) => error.includes("catalog plugin mlx-agent package for undeclared host: agentskills")));
+  assert(errors.some((error) => error.includes("required host missing: agentskills")));
   assert(errors.some((error) => error.includes("claude duplicate projection: mlx-agent")));
 });
 
