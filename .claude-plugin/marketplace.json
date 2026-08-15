@@ -12,11 +12,6 @@
       "name": "obsidian-agent",
       "source": { "source": "github", "repo": "cavi-ai/obsidian-agent" },
       "description": "Portable Obsidian vault workflows powered by the official Obsidian CLI."
-    },
-    {
-      "name": "harness",
-      "source": { "source": "github", "repo": "cavi-ai/harness" },
-      "description": "Policy engine for Claude Code sessions: hard stops, intent-scoped gates, advisories, outcome contracts."
     }
   ]
 }
