@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 export const HOSTS = ["claude", "codex", "gemini", "opencode", "agentskills"];
 // Marketplace identity: what users type after @ in `plugin install <name>@<marketplace>`.
 export const MARKETPLACE = "cavi-ai";
+// Every plugin the catalog may list. REQUIRED is the subset that must be present and ships a pinned Codex package.
+const CANONICAL = ["mlx-agent", "obsidian-agent", "harness"];
 const REQUIRED = ["mlx-agent", "obsidian-agent"];
 const INCLUDED_ROOTS = [".codex-plugin", "skills"];
 const SKILL_INVENTORIES = {
@@ -84,7 +86,7 @@ function unknownKeys(value, allowed) {
 }
 
 function validateCanonicalSchema(schema, catalog, errors) {
-  if (schema?.$schema !== "https://json-schema.org/draft/2020-12/schema" || schema?.$id !== "https://github.com/cavi-ai/plugins/catalog.schema.json" || schema?.type !== "object" || schema?.additionalProperties !== false || schema?.properties?.name?.const !== MARKETPLACE || schema?.properties?.plugins?.minItems !== 2 || schema?.properties?.plugins?.maxItems !== 2 || schema?.$defs?.plugin?.additionalProperties !== false || JSON.stringify(schema?.$defs?.host?.enum) !== JSON.stringify(HOSTS)) errors.push("catalog schema contract invalid");
+  if (schema?.$schema !== "https://json-schema.org/draft/2020-12/schema" || schema?.$id !== "https://github.com/cavi-ai/plugins/catalog.schema.json" || schema?.type !== "object" || schema?.additionalProperties !== false || schema?.properties?.name?.const !== MARKETPLACE || schema?.properties?.plugins?.minItems !== 1 || schema?.properties?.plugins?.maxItems !== undefined || schema?.$defs?.plugin?.additionalProperties !== false || JSON.stringify(schema?.$defs?.host?.enum) !== JSON.stringify(HOSTS)) errors.push("catalog schema contract invalid");
   const violation = (location, message) => errors.push(`catalog schema violation: ${location} ${message}`);
   if (!catalog || typeof catalog !== "object" || Array.isArray(catalog)) { violation("root", "must be an object"); return; }
   if (catalog.$schema !== "./catalog.schema.json") errors.push("catalog schema reference invalid");
@@ -94,19 +96,19 @@ function validateCanonicalSchema(schema, catalog, errors) {
   else if (catalog.name !== MARKETPLACE) violation("name", `must equal ${MARKETPLACE}`);
   if (!Object.hasOwn(catalog, "plugins")) violation("plugins", "is required");
   else if (!Array.isArray(catalog.plugins)) violation("plugins", "must be an array");
-  else if (catalog.plugins.length !== 2) violation("plugins", "must contain exactly 2 items");
+  else if (catalog.plugins.length < 1) violation("plugins", "must contain at least 1 item");
   for (const [index, plugin] of (Array.isArray(catalog.plugins) ? catalog.plugins : []).entries()) {
     const location = `plugins[${index}]`;
     if (!plugin || typeof plugin !== "object" || Array.isArray(plugin)) { violation(location, "must be an object"); continue; }
     for (const key of unknownKeys(plugin, ["name", "repository", "license", "summary", "hosts", "packages"])) errors.push(`catalog plugin ${plugin?.name} unknown property: ${key}`);
     for (const key of ["name", "repository", "license", "summary", "hosts", "packages"]) if (!Object.hasOwn(plugin, key)) violation(`${location}.${key}`, "is required");
-    if (Object.hasOwn(plugin, "name") && !REQUIRED.includes(plugin.name)) violation(`${location}.name`, "must be a canonical plugin name");
+    if (Object.hasOwn(plugin, "name") && !CANONICAL.includes(plugin.name)) violation(`${location}.name`, "must be a canonical plugin name");
     if (Object.hasOwn(plugin, "repository") && (typeof plugin.repository !== "string" || !/^cavi-ai\/[a-z0-9-]+$/.test(plugin.repository))) violation(`${location}.repository`, "must match ^cavi-ai/[a-z0-9-]+$");
     for (const key of ["license", "summary"]) if (Object.hasOwn(plugin, key) && (typeof plugin[key] !== "string" || plugin[key].length < 1)) violation(`${location}.${key}`, "must be a non-empty string");
     if (Object.hasOwn(plugin, "hosts")) {
       if (!Array.isArray(plugin.hosts)) violation(`${location}.hosts`, "must be an array");
       else {
-        if (plugin.hosts.length !== 5) violation(`${location}.hosts`, "must contain exactly 5 items");
+        if (plugin.hosts.length < 1) violation(`${location}.hosts`, "must contain at least 1 item");
         if (new Set(plugin.hosts.map((host) => JSON.stringify(host))).size !== plugin.hosts.length) violation(`${location}.hosts`, "must contain unique items");
         plugin.hosts.forEach((host, hostIndex) => { if (!HOSTS.includes(host)) violation(`${location}.hosts[${hostIndex}]`, "must be a supported host"); });
       }
@@ -114,7 +116,9 @@ function validateCanonicalSchema(schema, catalog, errors) {
     if (!Object.hasOwn(plugin, "packages")) continue;
     if (!plugin.packages || typeof plugin.packages !== "object" || Array.isArray(plugin.packages)) { violation(`${location}.packages`, "must be an object"); continue; }
     for (const key of unknownKeys(plugin.packages, HOSTS)) errors.push(`catalog plugin ${plugin?.name} unknown package host: ${key}`);
-    for (const host of HOSTS) {
+    const declared = Array.isArray(plugin.hosts) ? [...new Set(plugin.hosts.filter((host) => HOSTS.includes(host)))] : [];
+    for (const key of Object.keys(plugin.packages)) if (HOSTS.includes(key) && !declared.includes(key)) errors.push(`catalog plugin ${plugin?.name} package for undeclared host: ${key}`);
+    for (const host of declared) {
       if (!Object.hasOwn(plugin.packages, host)) { violation(`${location}.packages.${host}`, "is required"); continue; }
       const pkg = plugin.packages[host];
       if (!pkg || typeof pkg !== "object" || Array.isArray(pkg)) { violation(`${location}.packages.${host}`, "must be an object"); continue; }
@@ -262,14 +266,13 @@ export async function validateCatalog(root = process.cwd()) {
         seenHosts.add(host);
       }
       for (const host of plugin.hosts) if (!HOSTS.includes(host)) errors.push(`${prefix} unknown host: ${host}`);
-      for (const host of HOSTS) if (!seenHosts.has(host)) errors.push(`${prefix} required host missing: ${host}`);
       for (const host of new Set(plugin.hosts.filter((item) => HOSTS.includes(item)))) {
         if (!plugin.packages?.[host]?.path) errors.push(`${prefix} package path missing for host: ${host}`);
       }
     }
   }
   for (const name of REQUIRED) if (!byName.has(name)) errors.push(`required plugin missing: ${name}`);
-  for (const name of byName.keys()) if (!REQUIRED.includes(name)) errors.push(`unexpected plugin: ${name}`);
+  for (const name of byName.keys()) if (!CANONICAL.includes(name)) errors.push(`unexpected plugin: ${name}`);
 
   for (const [host, relative] of Object.entries(PROJECTIONS)) {
     const projection = await json(root, relative, errors);

@@ -29,6 +29,16 @@
         "opencode": { "path": "providers/opencode" },
         "agentskills": { "path": "providers/agentskills" }
       }
+    },
+    {
+      "name": "harness",
+      "repository": "cavi-ai/harness",
+      "license": "MIT",
+      "summary": "Policy engine for Claude Code sessions: hard stops, intent-scoped gates, advisories, outcome contracts.",
+      "hosts": ["claude"],
+      "packages": {
+        "claude": { "path": "." }
+      }
     }
   ]
 }
