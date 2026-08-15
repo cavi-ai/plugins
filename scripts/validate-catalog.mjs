@@ -5,6 +5,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const HOSTS = ["claude", "codex", "gemini", "opencode", "agentskills"];
+// Marketplace identity: what users type after @ in `plugin install <name>@<marketplace>`.
+export const MARKETPLACE = "cavi-ai";
 const REQUIRED = ["mlx-agent", "obsidian-agent"];
 const INCLUDED_ROOTS = [".codex-plugin", "skills"];
 const SKILL_INVENTORIES = {
@@ -82,14 +84,14 @@ function unknownKeys(value, allowed) {
 }
 
 function validateCanonicalSchema(schema, catalog, errors) {
-  if (schema?.$schema !== "https://json-schema.org/draft/2020-12/schema" || schema?.$id !== "https://github.com/cavi-ai/plugins/catalog.schema.json" || schema?.type !== "object" || schema?.additionalProperties !== false || schema?.properties?.name?.const !== "plugins" || schema?.properties?.plugins?.minItems !== 2 || schema?.properties?.plugins?.maxItems !== 2 || schema?.$defs?.plugin?.additionalProperties !== false || JSON.stringify(schema?.$defs?.host?.enum) !== JSON.stringify(HOSTS)) errors.push("catalog schema contract invalid");
+  if (schema?.$schema !== "https://json-schema.org/draft/2020-12/schema" || schema?.$id !== "https://github.com/cavi-ai/plugins/catalog.schema.json" || schema?.type !== "object" || schema?.additionalProperties !== false || schema?.properties?.name?.const !== MARKETPLACE || schema?.properties?.plugins?.minItems !== 2 || schema?.properties?.plugins?.maxItems !== 2 || schema?.$defs?.plugin?.additionalProperties !== false || JSON.stringify(schema?.$defs?.host?.enum) !== JSON.stringify(HOSTS)) errors.push("catalog schema contract invalid");
   const violation = (location, message) => errors.push(`catalog schema violation: ${location} ${message}`);
   if (!catalog || typeof catalog !== "object" || Array.isArray(catalog)) { violation("root", "must be an object"); return; }
   if (catalog.$schema !== "./catalog.schema.json") errors.push("catalog schema reference invalid");
   for (const key of unknownKeys(catalog, ["$schema", "name", "plugins"])) errors.push(`catalog unknown property: ${key}`);
   if (Object.hasOwn(catalog, "$schema") && typeof catalog.$schema !== "string") violation("$schema", "must be a string");
   if (!Object.hasOwn(catalog, "name")) violation("name", "is required");
-  else if (catalog.name !== "plugins") violation("name", "must equal plugins");
+  else if (catalog.name !== MARKETPLACE) violation("name", `must equal ${MARKETPLACE}`);
   if (!Object.hasOwn(catalog, "plugins")) violation("plugins", "is required");
   else if (!Array.isArray(catalog.plugins)) violation("plugins", "must be an array");
   else if (catalog.plugins.length !== 2) violation("plugins", "must contain exactly 2 items");
@@ -231,7 +233,7 @@ export async function validateCatalog(root = process.cwd()) {
   validateCanonicalSchema(schema === JSON_FAILURE ? null : schema, catalog, errors);
   if (!catalog || typeof catalog !== "object" || Array.isArray(catalog)) return errors.sort();
 
-  if (catalog.name !== "plugins") errors.push("catalog name must be plugins");
+  if (catalog.name !== MARKETPLACE) errors.push(`catalog name must be ${MARKETPLACE}`);
   if (!Array.isArray(catalog.plugins)) {
     errors.push("catalog plugins must be an array");
     return errors.sort();
@@ -273,7 +275,7 @@ export async function validateCatalog(root = process.cwd()) {
     const projection = await json(root, relative, errors);
     if (projection === JSON_FAILURE) continue;
     if (!projection || typeof projection !== "object" || Array.isArray(projection)) { errors.push(`${host} projection must be an object`); continue; }
-    if (projection.name !== "plugins") errors.push(`${host} projection name must be plugins`);
+    if (projection.name !== MARKETPLACE) errors.push(`${host} projection name must be ${MARKETPLACE}`);
     if (host === "claude" || host === "codex") validateNativeProjection(host, projection, errors);
     if (host === "gemini" || host === "opencode") {
       if (projection.host !== host) errors.push(`${host} projection host mismatch`);

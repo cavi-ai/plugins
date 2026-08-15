@@ -1,6 +1,6 @@
 {
   "$schema": "./catalog.schema.json",
-  "name": "plugins",
+  "name": "cavi-ai",
   "plugins": [
     {
       "name": "mlx-agent",

@@ -17,8 +17,8 @@ Add the marketplace, then install either plugin:
 
 ```text
 /plugin marketplace add cavi-ai/plugins
-/plugin install mlx-agent@plugins
-/plugin install obsidian-agent@plugins
+/plugin install mlx-agent@cavi-ai
+/plugin install obsidian-agent@cavi-ai
 ```
 
 ## Codex
@@ -27,8 +27,8 @@ Add the marketplace, then install either plugin:
 
 ```sh
 codex plugin marketplace add cavi-ai/plugins
-codex plugin add mlx-agent@plugins
-codex plugin add obsidian-agent@plugins
+codex plugin add mlx-agent@cavi-ai
+codex plugin add obsidian-agent@cavi-ai
 ```
 
 The Codex projection at [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json) uses Codex's documented marketplace-local source layout. `packages/codex/` contains minimal, self-contained projections copied from exact upstream commits. Each package includes provenance and a deterministic tree hash; catalog validation rejects local drift.
