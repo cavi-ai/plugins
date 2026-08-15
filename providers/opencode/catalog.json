@@ -1,5 +1,5 @@
 {
-  "name": "plugins",
+  "name": "cavi-ai",
   "host": "opencode",
   "protocol": "discovery",
   "plugins": [

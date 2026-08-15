@@ -1,6 +1,6 @@
 {
-  "name": "plugins",
-  "interface": { "displayName": "CAVI Plugins" },
+  "name": "cavi-ai",
+  "interface": { "displayName": "Cavi AI" },
   "plugins": [
     {
       "name": "mlx-agent",

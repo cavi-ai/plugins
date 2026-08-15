@@ -1,5 +1,5 @@
 {
-  "name": "plugins",
+  "name": "cavi-ai",
   "host": "gemini",
   "protocol": "discovery",
   "plugins": [

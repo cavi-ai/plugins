@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { validateCatalog } from "./validate-catalog.mjs";
+import { MARKETPLACE, validateCatalog } from "./validate-catalog.mjs";
 
 const hosts = ["claude", "codex", "gemini", "opencode", "agentskills"];
 const inventories = {
@@ -55,10 +55,10 @@ async function fixture({ catalog, claude = [], codex = [], gemini = [], opencode
   await writeFile(path.join(root, "catalog.json"), JSON.stringify(catalog));
   const nativeClaude = claude.map((item) => item.source ? item : { name: item.name, source: { source: "github", repo: item.repository }, description: `${item.name} fixture` });
   const nativeCodex = codex.map((item) => item.source ? item : { name: item.name, source: { source: "local", path: `./packages/codex/${item.name}` }, policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" }, category: "Productivity" });
-  await writeFile(path.join(root, ".claude-plugin/marketplace.json"), JSON.stringify({ name: "plugins", owner: { name: "CAVI", url: "https://github.com/cavi-ai" }, metadata: { description: "fixture" }, plugins: nativeClaude }));
-  await writeFile(path.join(root, ".agents/plugins/marketplace.json"), JSON.stringify({ name: "plugins", interface: { displayName: "CAVI Plugins" }, plugins: nativeCodex }));
-  await writeFile(path.join(root, "providers/gemini/catalog.json"), JSON.stringify({ name: "plugins", host: "gemini", protocol: "discovery", plugins: gemini }));
-  await writeFile(path.join(root, "providers/opencode/catalog.json"), JSON.stringify({ name: "plugins", host: "opencode", protocol: "discovery", plugins: opencode }));
+  await writeFile(path.join(root, ".claude-plugin/marketplace.json"), JSON.stringify({ name: MARKETPLACE, owner: { name: "Cavi AI", url: "https://github.com/cavi-ai" }, metadata: { description: "fixture" }, plugins: nativeClaude }));
+  await writeFile(path.join(root, ".agents/plugins/marketplace.json"), JSON.stringify({ name: MARKETPLACE, interface: { displayName: "Cavi AI" }, plugins: nativeCodex }));
+  await writeFile(path.join(root, "providers/gemini/catalog.json"), JSON.stringify({ name: MARKETPLACE, host: "gemini", protocol: "discovery", plugins: gemini }));
+  await writeFile(path.join(root, "providers/opencode/catalog.json"), JSON.stringify({ name: MARKETPLACE, host: "opencode", protocol: "discovery", plugins: opencode }));
   for (const name of Object.keys(inventories)) await createFixturePackage(root, name);
   const expectedIntegrity = {};
   for (const name of Object.keys(inventories)) {
@@ -71,7 +71,7 @@ async function fixture({ catalog, claude = [], codex = [], gemini = [], opencode
 
 const canonical = {
   $schema: "./catalog.schema.json",
-  name: "plugins",
+  name: MARKETPLACE,
   plugins: [plugin("mlx-agent"), plugin("obsidian-agent")]
 };
 
@@ -104,7 +104,7 @@ test("rejects duplicates, unknown hosts, missing repositories, and legacy identi
     ]
   };
   const errors = await validateCatalog(await fixture({ catalog: bad }));
-  assert(errors.some((error) => error.includes("catalog name must be plugins")));
+  assert(errors.some((error) => error.includes(`catalog name must be ${MARKETPLACE}`)));
   assert(errors.some((error) => error.includes("duplicate plugin name: mlx-agent")));
   assert(errors.some((error) => error.includes("unknown host: other")));
   assert(errors.some((error) => error.includes("repository is required")));
@@ -112,13 +112,13 @@ test("rejects duplicates, unknown hosts, missing repositories, and legacy identi
 });
 
 test("rejects missing required plugins and non-installable extras", async () => {
-  const errors = await validateCatalog(await fixture({ catalog: { name: "plugins", plugins: [plugin("mlx-agent"), plugin("bobby-browser")] } }));
+  const errors = await validateCatalog(await fixture({ catalog: { name: MARKETPLACE, plugins: [plugin("mlx-agent"), plugin("bobby-browser")] } }));
   assert(errors.some((error) => error.includes("required plugin missing: obsidian-agent")));
   assert(errors.some((error) => error.includes("unexpected plugin: bobby-browser")));
 });
 
 test("rejects absent projection entries and unsupported or mismatched projections", async () => {
-  const limited = { name: "plugins", plugins: [plugin("mlx-agent"), plugin("obsidian-agent", "cavi-ai/obsidian-agent", ["claude"])] };
+  const limited = { name: MARKETPLACE, plugins: [plugin("mlx-agent"), plugin("obsidian-agent", "cavi-ai/obsidian-agent", ["claude"])] };
   const root = await fixture({
     catalog: limited,
     claude: [entry("mlx-agent", "claude")],
@@ -147,7 +147,7 @@ test("rejects repository identity and package path mismatches", async () => {
 
 test("requires the complete host matrix without duplicate host or projection entries", async () => {
   const incomplete = {
-    name: "plugins",
+    name: MARKETPLACE,
     plugins: [plugin("mlx-agent", "cavi-ai/mlx-agent", ["claude", "claude", "codex", "gemini", "opencode"]), plugin("obsidian-agent")]
   };
   const root = await fixture({
@@ -165,7 +165,7 @@ test("requires the complete host matrix without duplicate host or projection ent
 
 test("requires each canonical repository to match the plugin identity", async () => {
   const wrongRepository = {
-    name: "plugins",
+    name: MARKETPLACE,
     plugins: [plugin("mlx-agent", "cavi-ai/not-mlx-agent"), plugin("obsidian-agent")]
   };
   const errors = await validateCatalog(await fixture({ catalog: wrongRepository }));

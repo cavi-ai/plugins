@@ -7,7 +7,7 @@
   "required": ["name", "plugins"],
   "properties": {
     "$schema": { "type": "string" },
-    "name": { "const": "plugins" },
+    "name": { "const": "cavi-ai" },
     "plugins": {
       "type": "array",
       "minItems": 2,
