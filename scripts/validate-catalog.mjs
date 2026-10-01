@@ -19,7 +19,6 @@ const MLX_EXCLUDED = [".mlx-agent-generated-files.json", "skills/*/scripts/mlx-a
 const MLX_EXCLUSION_REASON = "Codex skills use the packaged CLI entrypoint; MCP transport artifacts are not required or distributed by this catalog.";
 const DISCOVERY_COMMANDS = {
   gemini: {
-    "mlx-agent": "git clone https://github.com/cavi-ai/mlx-agent.git && gemini extensions install ./mlx-agent/providers/gemini",
     "obsidian-agent": "gemini extensions install https://github.com/cavi-ai/obsidian-agent"
   },
   opencode: {
@@ -106,7 +105,7 @@ function validateCanonicalSchema(schema, catalog, errors) {
     if (Object.hasOwn(plugin, "hosts")) {
       if (!Array.isArray(plugin.hosts)) violation(`${location}.hosts`, "must be an array");
       else {
-        if (plugin.hosts.length !== 5) violation(`${location}.hosts`, "must contain exactly 5 items");
+        if (plugin.hosts.length < 1) violation(`${location}.hosts`, "must contain at least 1 item");
         if (new Set(plugin.hosts.map((host) => JSON.stringify(host))).size !== plugin.hosts.length) violation(`${location}.hosts`, "must contain unique items");
         plugin.hosts.forEach((host, hostIndex) => { if (!HOSTS.includes(host)) violation(`${location}.hosts[${hostIndex}]`, "must be a supported host"); });
       }
@@ -114,7 +113,9 @@ function validateCanonicalSchema(schema, catalog, errors) {
     if (!Object.hasOwn(plugin, "packages")) continue;
     if (!plugin.packages || typeof plugin.packages !== "object" || Array.isArray(plugin.packages)) { violation(`${location}.packages`, "must be an object"); continue; }
     for (const key of unknownKeys(plugin.packages, HOSTS)) errors.push(`catalog plugin ${plugin?.name} unknown package host: ${key}`);
-    for (const host of HOSTS) {
+    const declared = Array.isArray(plugin.hosts) ? [...new Set(plugin.hosts.filter((host) => HOSTS.includes(host)))] : [];
+    for (const key of Object.keys(plugin.packages)) if (HOSTS.includes(key) && !declared.includes(key)) errors.push(`catalog plugin ${plugin?.name} package for undeclared host: ${key}`);
+    for (const host of declared) {
       if (!Object.hasOwn(plugin.packages, host)) { violation(`${location}.packages.${host}`, "is required"); continue; }
       const pkg = plugin.packages[host];
       if (!pkg || typeof pkg !== "object" || Array.isArray(pkg)) { violation(`${location}.packages.${host}`, "must be an object"); continue; }
@@ -262,7 +263,6 @@ export async function validateCatalog(root = process.cwd()) {
         seenHosts.add(host);
       }
       for (const host of plugin.hosts) if (!HOSTS.includes(host)) errors.push(`${prefix} unknown host: ${host}`);
-      for (const host of HOSTS) if (!seenHosts.has(host)) errors.push(`${prefix} required host missing: ${host}`);
       for (const host of new Set(plugin.hosts.filter((item) => HOSTS.includes(item)))) {
         if (!plugin.packages?.[host]?.path) errors.push(`${prefix} package path missing for host: ${host}`);
       }
