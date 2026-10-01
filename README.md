@@ -6,7 +6,7 @@
 
 | Plugin | Claude | Codex | Gemini | OpenCode | AgentSkills |
 | --- | :---: | :---: | :---: | :---: | :---: |
-| [`mlx-agent`](https://github.com/cavi-ai/mlx-agent) — discover, verify, and wire local MLX models | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [`mlx-agent`](https://github.com/cavi-ai/mlx-agent) — discover, verify, and wire local MLX models | ✓ | ✓ | — | ✓ | ✓ |
 | [`obsidian-agent`](https://github.com/cavi-ai/obsidian-agent) — portable vault workflows over the official Obsidian CLI | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 The machine-readable source of truth is [`catalog.json`](catalog.json). Claude and Codex consume native marketplace projections. Gemini and OpenCode use the discovery records under `providers/`, which link to each source repository's tested installer; those files do not claim a native marketplace protocol. Portable AgentSkills packages remain available from each plugin repository.
@@ -37,16 +37,13 @@ These package projections are distribution artifacts, not independent workflow s
 
 ## Gemini CLI
 
-Gemini discovery metadata is in [`providers/gemini/catalog.json`](providers/gemini/catalog.json). Each entry records the source repository's native installation command. For example:
+Gemini discovery metadata is in [`providers/gemini/catalog.json`](providers/gemini/catalog.json). Each entry records the source repository's native installation command:
 
 ```sh
-git clone https://github.com/cavi-ai/mlx-agent.git
-gemini extensions install ./mlx-agent/providers/gemini
-
 gemini extensions install https://github.com/cavi-ai/obsidian-agent
 ```
 
-Both commands use Gemini's native extension loader. The discovery catalog itself does not install anything.
+The command uses Gemini's native extension loader. The discovery catalog itself does not install anything. `mlx-agent` does not ship a Gemini extension.
 
 ## OpenCode
 
@@ -75,4 +72,4 @@ node --test
 node scripts/validate-catalog.mjs
 ```
 
-Validation rejects identity drift, unknown or missing hosts, duplicate entries, non-plugin products, and projections that disagree with the canonical repository or package path.
+Validation rejects identity drift, unknown hosts, packages for undeclared hosts, duplicate entries, non-plugin products, and projections that disagree with the canonical host list, repository, or package path.

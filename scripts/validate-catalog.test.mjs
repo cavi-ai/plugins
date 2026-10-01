@@ -13,15 +13,16 @@ const inventories = {
   "obsidian-agent": ["build-retrospective", "connection-finder", "consistent-tagging", "daily-rollup", "dedup-merge", "frontmatter-normalizer", "manifest-content", "manifest-core", "manifest-feature", "manifest-infra", "manifest-pm", "manifest-research", "manifest-risk", "manifest-vault", "meeting-cleanup", "moc-builder", "note-splitter", "outline-to-draft", "plan-to-spec", "source-digest", "summarize-and-link", "task-harvester", "tracker-driver", "vault-grounding", "vault-synthesis", "wikilink-weaver"]
 };
 const sourceCommits = { "mlx-agent": "923627988cf98e984fa36e0b940f86e7263e2958", "obsidian-agent": "7efecb058fce8185056cbe7868d6de1af11879a9" };
+const pluginHosts = { "mlx-agent": ["claude", "codex", "opencode", "agentskills"] };
 
-function plugin(name, repository = `cavi-ai/${name}`, supportedHosts = hosts) {
+function plugin(name, repository = `cavi-ai/${name}`, supportedHosts = pluginHosts[name] ?? hosts) {
   return {
     name,
     repository,
     license: "MIT",
     summary: `${name} summary`,
     hosts: supportedHosts,
-    packages: Object.fromEntries(hosts.map((host) => [host, { path: host === "claude" ? "." : host === "codex" ? `packages/codex/${name}` : host === "gemini" ? (name === "mlx-agent" ? "providers/gemini" : ".") : host === "opencode" ? "providers/opencode" : "providers/agentskills" }]))
+    packages: Object.fromEntries([...new Set(supportedHosts)].filter((host) => hosts.includes(host)).map((host) => [host, { path: host === "claude" ? "." : host === "codex" ? `packages/codex/${name}` : host === "gemini" ? "." : host === "opencode" ? "providers/opencode" : "providers/agentskills" }]))
   };
 }
 
@@ -79,7 +80,7 @@ const entry = (name, host) => ({
   name,
   repository: `cavi-ai/${name}`,
   package: canonical.plugins.find((item) => item.name === name).packages[host].path,
-  ...(host === "gemini" ? { install: { command: name === "mlx-agent" ? "git clone https://github.com/cavi-ai/mlx-agent.git && gemini extensions install ./mlx-agent/providers/gemini" : "gemini extensions install https://github.com/cavi-ai/obsidian-agent" } } : {}),
+  ...(host === "gemini" ? { install: { command: "gemini extensions install https://github.com/cavi-ai/obsidian-agent" } } : {}),
   ...(host === "opencode" ? { install: { command: name === "mlx-agent" ? "git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install opencode --scope user --dry-run --json" : "git clone https://github.com/cavi-ai/obsidian-agent.git && node obsidian-agent/scripts/install.mjs --host opencode --scope user --dry-run" } } : {})
 });
 
@@ -88,10 +89,23 @@ test("accepts exactly the two canonical plugins and truthful host projections", 
     catalog: canonical,
     claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")],
     codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")],
-    gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")],
+    gemini: [entry("obsidian-agent", "gemini")],
     opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")]
   });
   assert.deepEqual(await validateCatalog(root), []);
+});
+
+test("rejects a discovery projection for a host the plugin does not declare", async () => {
+  const root = await fixture({
+    catalog: canonical,
+    claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")],
+    codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")],
+    gemini: [{ name: "mlx-agent", repository: "cavi-ai/mlx-agent", package: "providers/gemini", install: { command: "git clone https://github.com/cavi-ai/mlx-agent.git && gemini extensions install ./mlx-agent/providers/gemini" } }, entry("obsidian-agent", "gemini")],
+    opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")]
+  });
+  const errors = await validateCatalog(root);
+  assert(errors.some((error) => error.includes("gemini projects unsupported plugin host: mlx-agent")));
+  assert(errors.some((error) => error.includes("gemini install command mismatch: mlx-agent")));
 });
 
 test("rejects duplicates, unknown hosts, missing repositories, and legacy identities", async () => {
@@ -123,7 +137,7 @@ test("rejects absent projection entries and unsupported or mismatched projection
     catalog: limited,
     claude: [entry("mlx-agent", "claude")],
     codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex"), { name: "ghost", repository: "cavi-ai/ghost", package: ".codex-plugin" }],
-    gemini: [entry("mlx-agent", "gemini")],
+    gemini: [],
     opencode: [entry("mlx-agent", "opencode")]
   });
   const errors = await validateCatalog(root);
@@ -137,7 +151,7 @@ test("rejects repository identity and package path mismatches", async () => {
     catalog: canonical,
     claude: [{ ...entry("mlx-agent", "claude"), repository: "other/mlx-agent" }, entry("obsidian-agent", "claude")],
     codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")],
-    gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")],
+    gemini: [entry("obsidian-agent", "gemini")],
     opencode: [entry("mlx-agent", "opencode"), { ...entry("obsidian-agent", "opencode"), package: "wrong" }]
   });
   const errors = await validateCatalog(root);
@@ -145,21 +159,22 @@ test("rejects repository identity and package path mismatches", async () => {
   assert(errors.some((error) => error.includes("opencode package mismatch: obsidian-agent")));
 });
 
-test("requires the complete host matrix without duplicate host or projection entries", async () => {
+test("rejects duplicate hosts, packages for undeclared hosts, and duplicate projection entries", async () => {
   const incomplete = {
     name: MARKETPLACE,
-    plugins: [plugin("mlx-agent", "cavi-ai/mlx-agent", ["claude", "claude", "codex", "gemini", "opencode"]), plugin("obsidian-agent")]
+    plugins: [plugin("mlx-agent", "cavi-ai/mlx-agent", ["claude", "claude", "codex", "opencode"]), plugin("obsidian-agent")]
   };
+  incomplete.plugins[0].packages.gemini = { path: "providers/gemini" };
   const root = await fixture({
     catalog: incomplete,
     claude: [entry("mlx-agent", "claude"), entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")],
     codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")],
-    gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")],
+    gemini: [entry("obsidian-agent", "gemini")],
     opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")]
   });
   const errors = await validateCatalog(root);
   assert(errors.some((error) => error.includes("duplicate host: claude")));
-  assert(errors.some((error) => error.includes("required host missing: agentskills")));
+  assert(errors.some((error) => error.includes("catalog plugin mlx-agent package for undeclared host: gemini")));
   assert(errors.some((error) => error.includes("claude duplicate projection: mlx-agent")));
 });
 
@@ -177,12 +192,12 @@ test("requires explicit install commands in discovery projections", async () => 
     catalog: canonical,
     claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")],
     codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")],
-    gemini: [{ ...entry("mlx-agent", "gemini"), install: undefined }, entry("obsidian-agent", "gemini")],
-    opencode: [entry("mlx-agent", "opencode"), { ...entry("obsidian-agent", "opencode"), install: {} }]
+    gemini: [{ ...entry("obsidian-agent", "gemini"), install: undefined }],
+    opencode: [{ ...entry("mlx-agent", "opencode"), install: {} }, entry("obsidian-agent", "opencode")]
   });
   const errors = await validateCatalog(root);
-  assert(errors.some((error) => error.includes("gemini install command missing: mlx-agent")));
-  assert(errors.some((error) => error.includes("opencode install command missing: obsidian-agent")));
+  assert(errors.some((error) => error.includes("gemini install command missing: obsidian-agent")));
+  assert(errors.some((error) => error.includes("opencode install command missing: mlx-agent")));
 });
 
 test("the published Codex projection uses resolvable marketplace-local packages", async () => {
@@ -204,7 +219,7 @@ test("rejects drift inside a pinned Codex package", async () => {
     catalog: canonical,
     claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")],
     codex: [entry("mlx-agent", "codex"), { name: "obsidian-agent", source: { source: "local", path: "./packages/codex/obsidian-agent" } }],
-    gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")],
+    gemini: [entry("obsidian-agent", "gemini")],
     opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")]
   });
   await mkdir(path.join(root, "packages/codex"), { recursive: true });
@@ -215,7 +230,7 @@ test("rejects drift inside a pinned Codex package", async () => {
 });
 
 test("rejects vendored drift even when package-local provenance is recomputed", async () => {
-  const root = await fixture({ catalog: canonical, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
+  const root = await fixture({ catalog: canonical, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
   const packageRoot = path.join(root, "packages/codex/obsidian-agent");
   await writeFile(path.join(packageRoot, "skills/vault-grounding/SKILL.md"), "---\nname: vault-grounding\ndescription: attacker content\n---\n");
   const provenancePath = path.join(packageRoot, "provenance.json");
@@ -227,7 +242,7 @@ test("rejects vendored drift even when package-local provenance is recomputed", 
 });
 
 test("rejects self-selected integrity roots and missing authoritative skills", async () => {
-  const root = await fixture({ catalog: canonical, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
+  const root = await fixture({ catalog: canonical, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
   const packageRoot = path.join(root, "packages/codex/obsidian-agent");
   await rm(path.join(packageRoot, "skills/wikilink-weaver"), { recursive: true });
   const provenancePath = path.join(packageRoot, "provenance.json");
@@ -241,7 +256,7 @@ test("rejects self-selected integrity roots and missing authoritative skills", a
 });
 
 test("rejects live and dangling symlinks in Codex package trees", async () => {
-  const root = await fixture({ catalog: canonical, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
+  const root = await fixture({ catalog: canonical, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
   const outside = path.join(root, "outside.md");
   await writeFile(outside, "outside");
   await symlink(outside, path.join(root, "packages/codex/obsidian-agent/skills/vault-grounding/live.md"));
@@ -251,7 +266,7 @@ test("rejects live and dangling symlinks in Codex package trees", async () => {
 });
 
 test("rejects package-root and included-root symlinks", async () => {
-  const root = await fixture({ catalog: canonical, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
+  const root = await fixture({ catalog: canonical, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
   const obsidianPackage = path.join(root, "packages/codex/obsidian-agent");
   const outsidePackage = path.join(root, "outside-obsidian-package");
   await cp(obsidianPackage, outsidePackage, { recursive: true });
@@ -269,7 +284,7 @@ test("rejects package-root and included-root symlinks", async () => {
 
 test("applies canonical schema and rejects malformed native projections", async () => {
   const badCatalog = { ...canonical, unexpected: true };
-  const root = await fixture({ catalog: badCatalog, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [entry("mlx-agent", "gemini"), entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
+  const root = await fixture({ catalog: badCatalog, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
   const claude = JSON.parse(await readFile(path.join(root, ".claude-plugin/marketplace.json"), "utf8"));
   claude.plugins[0] = { name: "mlx-agent", repository: "cavi-ai/mlx-agent", package: "." };
   await writeFile(path.join(root, ".claude-plugin/marketplace.json"), JSON.stringify(claude));
@@ -292,7 +307,8 @@ test("enforces fixed schema object, array, required, enum, and additional-proper
     [(catalog) => { delete catalog.plugins[0].license; }, "catalog schema violation: plugins[0].license is required"],
     [(catalog) => { catalog.plugins[0].name = "other"; }, "catalog schema violation: plugins[0].name must be a canonical plugin name"],
     [(catalog) => { catalog.plugins[0].hosts = "claude"; }, "catalog schema violation: plugins[0].hosts must be an array"],
-    [(catalog) => { catalog.plugins[0].hosts[4] = "claude"; }, "catalog schema violation: plugins[0].hosts must contain unique items"],
+    [(catalog) => { catalog.plugins[0].hosts = []; }, "catalog schema violation: plugins[0].hosts must contain at least 1 item"],
+    [(catalog) => { catalog.plugins[0].hosts.push("claude"); }, "catalog schema violation: plugins[0].hosts must contain unique items"],
     [(catalog) => { catalog.plugins[0].packages = []; }, "catalog schema violation: plugins[0].packages must be an object"],
     [(catalog) => { delete catalog.plugins[0].packages.codex; }, "catalog schema violation: plugins[0].packages.codex is required"],
     [(catalog) => { catalog.plugins[0].packages.codex = "local"; }, "catalog schema violation: plugins[0].packages.codex must be an object"],
@@ -338,7 +354,7 @@ test("requires a closed and fully typed trusted-integrity registry", async () =>
 });
 
 test("rejects cross-plugin discovery command drift", async () => {
-  const root = await fixture({ catalog: canonical, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [{ ...entry("mlx-agent", "gemini"), install: { command: "gemini extensions install https://github.com/cavi-ai/obsidian-agent" } }, entry("obsidian-agent", "gemini")], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")] });
+  const root = await fixture({ catalog: canonical, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], gemini: [entry("obsidian-agent", "gemini")], opencode: [{ ...entry("mlx-agent", "opencode"), install: { command: entry("obsidian-agent", "opencode").install.command } }, entry("obsidian-agent", "opencode")] });
   const errors = await validateCatalog(root);
-  assert(errors.some((error) => error.includes("gemini install command mismatch: mlx-agent")));
+  assert(errors.some((error) => error.includes("opencode install command mismatch: mlx-agent")));
 });
