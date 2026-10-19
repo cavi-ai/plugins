@@ -7,11 +7,13 @@
       "repository": "cavi-ai/mlx-agent",
       "license": "MIT",
       "summary": "Discover, verify, and wire local MLX-optimized models on Apple Silicon.",
-      "hosts": ["claude", "codex", "opencode", "agentskills"],
+      "hosts": ["claude", "codex", "opencode", "openclaw", "hermes", "agentskills"],
       "packages": {
         "claude": { "path": "." },
         "codex": { "path": "packages/codex/mlx-agent" },
         "opencode": { "path": "providers/opencode" },
+        "openclaw": { "path": "providers/agentskills" },
+        "hermes": { "path": "providers/agentskills" },
         "agentskills": { "path": "providers/agentskills" }
       }
     },

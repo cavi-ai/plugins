@@ -4,12 +4,12 @@
 
 ## Plugins
 
-| Plugin | Claude | Codex | Gemini | OpenCode | AgentSkills |
-| --- | :---: | :---: | :---: | :---: | :---: |
-| [`mlx-agent`](https://github.com/cavi-ai/mlx-agent) — discover, verify, and wire local MLX models | ✓ | ✓ | — | ✓ | ✓ |
-| [`obsidian-agent`](https://github.com/cavi-ai/obsidian-agent) — portable vault workflows over the official Obsidian CLI | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Plugin | Claude | Codex | Gemini | OpenCode | OpenClaw | Hermes | AgentSkills |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| [`mlx-agent`](https://github.com/cavi-ai/mlx-agent) — discover, verify, and wire local MLX models | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ |
+| [`obsidian-agent`](https://github.com/cavi-ai/obsidian-agent) — portable vault workflows over the official Obsidian CLI | ✓ | ✓ | ✓ | ✓ | — | — | ✓ |
 
-The machine-readable source of truth is [`catalog.json`](catalog.json). Claude and Codex consume native marketplace projections. Gemini and OpenCode use the discovery records under `providers/`, which link to each source repository's tested installer; those files do not claim a native marketplace protocol. Portable AgentSkills packages remain available from each plugin repository.
+The machine-readable source of truth is [`catalog.json`](catalog.json). Claude and Codex consume native marketplace projections. Gemini, OpenCode, OpenClaw, and Hermes use the discovery records under `providers/`, which link to each source repository's tested installer; those files do not claim a native marketplace protocol. Portable AgentSkills packages remain available from each plugin repository.
 
 ## Claude Code
 
@@ -58,6 +58,18 @@ node obsidian-agent/scripts/install.mjs --host opencode --scope user --dry-run
 ```
 
 Review the destination paths and use the exact preview hash when confirming.
+
+## OpenClaw and Hermes
+
+OpenClaw and Hermes discovery metadata is in [`providers/openclaw/catalog.json`](providers/openclaw/catalog.json) and [`providers/hermes/catalog.json`](providers/hermes/catalog.json). The `mlx-agent` installer places its skills in `$OPENCLAW_STATE_DIR/skills` or `$HERMES_HOME/skills`:
+
+```sh
+git clone https://github.com/cavi-ai/mlx-agent.git
+python3 mlx-agent/scripts/mlx-agent install openclaw --scope user --dry-run --json
+python3 mlx-agent/scripts/mlx-agent install hermes --scope user --dry-run --json
+```
+
+Review the destination paths and use the exact preview hash when confirming. `obsidian-agent` does not ship an OpenClaw or Hermes adapter.
 
 ## AgentSkills
 

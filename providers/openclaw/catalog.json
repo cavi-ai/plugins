@@ -1,0 +1,13 @@
+{
+  "name": "cavi-ai",
+  "host": "openclaw",
+  "protocol": "discovery",
+  "plugins": [
+    {
+      "name": "mlx-agent",
+      "repository": "cavi-ai/mlx-agent",
+      "package": "providers/agentskills",
+      "install": { "command": "git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install openclaw --scope user --dry-run --json" }
+    }
+  ]
+}

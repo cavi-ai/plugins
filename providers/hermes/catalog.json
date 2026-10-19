@@ -1,0 +1,13 @@
+{
+  "name": "cavi-ai",
+  "host": "hermes",
+  "protocol": "discovery",
+  "plugins": [
+    {
+      "name": "mlx-agent",
+      "repository": "cavi-ai/mlx-agent",
+      "package": "providers/agentskills",
+      "install": { "command": "git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install hermes --scope user --dry-run --json" }
+    }
+  ]
+}
