@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const HOSTS = ["claude", "codex", "gemini", "opencode", "agentskills"];
+export const HOSTS = ["claude", "codex", "gemini", "opencode", "openclaw", "hermes", "agentskills"];
 // Marketplace identity: what users type after @ in `plugin install <name>@<marketplace>`.
 export const MARKETPLACE = "cavi-ai";
 const REQUIRED = ["mlx-agent", "obsidian-agent"];
@@ -24,14 +24,23 @@ const DISCOVERY_COMMANDS = {
   opencode: {
     "mlx-agent": "git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install opencode --scope user --dry-run --json",
     "obsidian-agent": "git clone https://github.com/cavi-ai/obsidian-agent.git && node obsidian-agent/scripts/install.mjs --host opencode --scope user --dry-run"
+  },
+  openclaw: {
+    "mlx-agent": "git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install openclaw --scope user --dry-run --json"
+  },
+  hermes: {
+    "mlx-agent": "git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install hermes --scope user --dry-run --json"
   }
 };
+const DISCOVERY_HOSTS = Object.keys(DISCOVERY_COMMANDS);
 const LEGACY = new Set(["claude-plugins", "claude-obsidian", "claude-obsidian-plugin"]);
 const PROJECTIONS = {
   claude: ".claude-plugin/marketplace.json",
   codex: ".agents/plugins/marketplace.json",
   gemini: "providers/gemini/catalog.json",
-  opencode: "providers/opencode/catalog.json"
+  opencode: "providers/opencode/catalog.json",
+  openclaw: "providers/openclaw/catalog.json",
+  hermes: "providers/hermes/catalog.json"
 };
 const JSON_FAILURE = Symbol("JSON_FAILURE");
 
@@ -277,7 +286,7 @@ export async function validateCatalog(root = process.cwd()) {
     if (!projection || typeof projection !== "object" || Array.isArray(projection)) { errors.push(`${host} projection must be an object`); continue; }
     if (projection.name !== MARKETPLACE) errors.push(`${host} projection name must be ${MARKETPLACE}`);
     if (host === "claude" || host === "codex") validateNativeProjection(host, projection, errors);
-    if (host === "gemini" || host === "opencode") {
+    if (DISCOVERY_HOSTS.includes(host)) {
       if (projection.host !== host) errors.push(`${host} projection host mismatch`);
       if (projection.protocol !== "discovery") errors.push(`${host} projection must use discovery protocol`);
     }
@@ -288,10 +297,10 @@ export async function validateCatalog(root = process.cwd()) {
     const projected = new Set();
     for (const raw of projection.plugins) {
       const entry = projectionIdentity(raw);
-      if ((host === "gemini" || host === "opencode") && (typeof raw?.install?.command !== "string" || !raw.install.command.trim())) {
+      if (DISCOVERY_HOSTS.includes(host) && (typeof raw?.install?.command !== "string" || !raw.install.command.trim())) {
         errors.push(`${host} install command missing: ${entry.name}`);
       }
-      if ((host === "gemini" || host === "opencode") && DISCOVERY_COMMANDS[host]?.[entry.name] !== raw?.install?.command) errors.push(`${host} install command mismatch: ${entry.name}`);
+      if (DISCOVERY_HOSTS.includes(host) && DISCOVERY_COMMANDS[host]?.[entry.name] !== raw?.install?.command) errors.push(`${host} install command mismatch: ${entry.name}`);
       if (projected.has(entry.name)) errors.push(`${host} duplicate projection: ${entry.name}`);
       projected.add(entry.name);
       const canonical = byName.get(entry.name);
