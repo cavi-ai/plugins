@@ -8,17 +8,19 @@
 | --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | [`mlx-agent`](https://github.com/cavi-ai/mlx-agent) — discover, verify, and wire local MLX models | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ |
 | [`obsidian-agent`](https://github.com/cavi-ai/obsidian-agent) — portable vault workflows over the official Obsidian CLI | ✓ | ✓ | ✓ | ✓ | — | — | ✓ |
+| [`loop-killer`](https://github.com/cavi-ai/loop-killer) — end stop-hook re-prompt loops by clearing the active goal | ✓ | — | — | — | — | — | — |
 
 The machine-readable source of truth is [`catalog.json`](catalog.json). Claude and Codex consume native marketplace projections. Gemini, OpenCode, OpenClaw, and Hermes use the discovery records under `providers/`, which link to each source repository's tested installer; those files do not claim a native marketplace protocol. Portable AgentSkills packages remain available from each plugin repository.
 
 ## Claude Code
 
-Add the marketplace, then install either plugin:
+Add the marketplace, then install a plugin:
 
 ```text
 /plugin marketplace add cavi-ai/plugins
 /plugin install mlx-agent@cavi-ai
 /plugin install obsidian-agent@cavi-ai
+/plugin install loop-killer@cavi-ai
 ```
 
 ## Codex
