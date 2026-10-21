@@ -89,7 +89,7 @@ const entry = (name, host) => ({
   ...(host === "openclaw" || host === "hermes" ? { install: { command: `git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install ${host} --scope user --dry-run --json` } } : {})
 });
 
-test("accepts exactly the two canonical plugins and truthful host projections", async () => {
+test("accepts the canonical plugins and truthful host projections", async () => {
   const root = await fixture({
     catalog: canonical,
     claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")],
@@ -100,6 +100,35 @@ test("accepts exactly the two canonical plugins and truthful host projections", 
     hermes: [entry("mlx-agent", "hermes")]
   });
   assert.deepEqual(await validateCatalog(root), []);
+});
+
+test("accepts a claude-only plugin projected only to claude", async () => {
+  const withLoopKiller = { ...canonical, plugins: [...canonical.plugins, plugin("loop-killer", "cavi-ai/loop-killer", ["claude"])] };
+  const loopKiller = { name: "loop-killer", repository: "cavi-ai/loop-killer", package: "." };
+  const projections = {
+    gemini: [entry("obsidian-agent", "gemini")],
+    opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")],
+    openclaw: [entry("mlx-agent", "openclaw")],
+    hermes: [entry("mlx-agent", "hermes")]
+  };
+  const root = await fixture({
+    catalog: withLoopKiller,
+    claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude"), loopKiller],
+    codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")],
+    ...projections
+  });
+  assert.deepEqual(await validateCatalog(root), []);
+  const projectedWide = await fixture({
+    catalog: withLoopKiller,
+    claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude"), loopKiller],
+    codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")],
+    ...projections,
+    opencode: [...projections.opencode, { ...loopKiller, install: { command: "git clone https://github.com/cavi-ai/loop-killer.git" } }]
+  });
+  const errors = await validateCatalog(projectedWide);
+  assert(errors.some((error) => error.includes("opencode projects unsupported plugin host: loop-killer")));
+  const unprojected = await validateCatalog(await fixture({ catalog: withLoopKiller, claude: [entry("mlx-agent", "claude"), entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], ...projections }));
+  assert(unprojected.includes("claude projection missing: loop-killer"));
 });
 
 test("requires openclaw and hermes discovery records only for plugins that declare them", async () => {
