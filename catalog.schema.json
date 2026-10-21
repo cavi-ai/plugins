@@ -15,7 +15,7 @@
     }
   },
   "$defs": {
-    "host": { "enum": ["claude", "codex", "gemini", "opencode", "openclaw", "hermes", "agentskills"] },
+    "host": { "enum": ["claude", "codex", "agy", "opencode", "openclaw", "hermes", "agentskills"] },
     "package": {
       "type": "object",
       "additionalProperties": false,
@@ -38,7 +38,7 @@
           "properties": {
             "claude": { "$ref": "#/$defs/package" },
             "codex": { "$ref": "#/$defs/package" },
-            "gemini": { "$ref": "#/$defs/package" },
+            "agy": { "$ref": "#/$defs/package" },
             "opencode": { "$ref": "#/$defs/package" },
             "openclaw": { "$ref": "#/$defs/package" },
             "hermes": { "$ref": "#/$defs/package" },

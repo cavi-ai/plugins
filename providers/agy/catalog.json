@@ -1,0 +1,13 @@
+{
+  "name": "cavi-ai",
+  "host": "agy",
+  "protocol": "discovery",
+  "plugins": [
+    {
+      "name": "mlx-agent",
+      "repository": "cavi-ai/mlx-agent",
+      "package": "providers/agy",
+      "install": { "command": "git clone https://github.com/cavi-ai/mlx-agent.git && agy plugin install ./mlx-agent/providers/agy" }
+    }
+  ]
+}

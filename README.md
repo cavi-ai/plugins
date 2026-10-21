@@ -4,13 +4,13 @@
 
 ## Plugins
 
-| Plugin | Claude | Codex | Gemini | OpenCode | OpenClaw | Hermes | AgentSkills |
+| Plugin | Claude | Codex | Agy | OpenCode | OpenClaw | Hermes | AgentSkills |
 | --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| [`mlx-agent`](https://github.com/cavi-ai/mlx-agent) — discover, verify, and wire local MLX models | ✓ | ✓ | — | ✓ | ✓ | ✓ | ✓ |
-| [`obsidian-agent`](https://github.com/cavi-ai/obsidian-agent) — portable vault workflows over the official Obsidian CLI | ✓ | ✓ | ✓ | ✓ | — | — | ✓ |
+| [`mlx-agent`](https://github.com/cavi-ai/mlx-agent) — discover, verify, and wire local MLX models | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| [`obsidian-agent`](https://github.com/cavi-ai/obsidian-agent) — portable vault workflows over the official Obsidian CLI | ✓ | ✓ | — | ✓ | — | — | ✓ |
 | [`loop-killer`](https://github.com/cavi-ai/loop-killer) — end stop-hook re-prompt loops by clearing the active goal | ✓ | — | — | — | — | — | — |
 
-The machine-readable source of truth is [`catalog.json`](catalog.json). Claude and Codex consume native marketplace projections. Gemini, OpenCode, OpenClaw, and Hermes use the discovery records under `providers/`, which link to each source repository's tested installer; those files do not claim a native marketplace protocol. Portable AgentSkills packages remain available from each plugin repository.
+The machine-readable source of truth is [`catalog.json`](catalog.json). Claude and Codex consume native marketplace projections. Agy, OpenCode, OpenClaw, and Hermes use the discovery records under `providers/`, which link to each source repository's tested installer; those files do not claim a native marketplace protocol. Portable AgentSkills packages remain available from each plugin repository.
 
 ## Claude Code
 
@@ -37,15 +37,16 @@ The Codex projection at [`.agents/plugins/marketplace.json`](.agents/plugins/mar
 
 These package projections are distribution artifacts, not independent workflow sources. Refresh one only from a reviewed upstream commit, update its `provenance.json`, and run the full catalog gate. Product development remains in the linked plugin repository.
 
-## Gemini CLI
+## Agy
 
-Gemini discovery metadata is in [`providers/gemini/catalog.json`](providers/gemini/catalog.json). Each entry records the source repository's native installation command:
+Agy discovery metadata is in [`providers/agy/catalog.json`](providers/agy/catalog.json). Each entry records the source repository's native installation command:
 
 ```sh
-gemini extensions install https://github.com/cavi-ai/obsidian-agent
+git clone https://github.com/cavi-ai/mlx-agent.git
+agy plugin install ./mlx-agent/providers/agy
 ```
 
-The command uses Gemini's native extension loader. The discovery catalog itself does not install anything. `mlx-agent` does not ship a Gemini extension.
+The discovery catalog itself does not install anything. `obsidian-agent` does not ship an Agy plugin.
 
 ## OpenCode
 
