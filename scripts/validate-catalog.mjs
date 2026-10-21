@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const HOSTS = ["claude", "codex", "gemini", "opencode", "openclaw", "hermes", "agentskills"];
+export const HOSTS = ["claude", "codex", "agy", "opencode", "openclaw", "hermes", "agentskills"];
 // Marketplace identity: what users type after @ in `plugin install <name>@<marketplace>`.
 export const MARKETPLACE = "cavi-ai";
 // Every plugin the catalog may list. REQUIRED is the subset that must be present and ships a pinned Codex package.
@@ -20,8 +20,8 @@ const SOURCE_PATHS = { "mlx-agent": "providers/codex", "obsidian-agent": "." };
 const MLX_EXCLUDED = [".mlx-agent-generated-files.json", "skills/*/scripts/mlx-agent-mcp", "skills/*/src/mlx_agent/mcp_server.py"];
 const MLX_EXCLUSION_REASON = "Codex skills use the packaged CLI entrypoint; MCP transport artifacts are not required or distributed by this catalog.";
 const DISCOVERY_COMMANDS = {
-  gemini: {
-    "obsidian-agent": "gemini extensions install https://github.com/cavi-ai/obsidian-agent"
+  agy: {
+    "mlx-agent": "git clone https://github.com/cavi-ai/mlx-agent.git && agy plugin install ./mlx-agent/providers/agy"
   },
   opencode: {
     "mlx-agent": "git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install opencode --scope user --dry-run --json",
@@ -39,7 +39,7 @@ const LEGACY = new Set(["claude-plugins", "claude-obsidian", "claude-obsidian-pl
 const PROJECTIONS = {
   claude: ".claude-plugin/marketplace.json",
   codex: ".agents/plugins/marketplace.json",
-  gemini: "providers/gemini/catalog.json",
+  agy: "providers/agy/catalog.json",
   opencode: "providers/opencode/catalog.json",
   openclaw: "providers/openclaw/catalog.json",
   hermes: "providers/hermes/catalog.json"

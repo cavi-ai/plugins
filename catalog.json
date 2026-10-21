@@ -7,10 +7,11 @@
       "repository": "cavi-ai/mlx-agent",
       "license": "MIT",
       "summary": "Discover, verify, and wire local MLX-optimized models on Apple Silicon.",
-      "hosts": ["claude", "codex", "opencode", "openclaw", "hermes", "agentskills"],
+      "hosts": ["claude", "codex", "agy", "opencode", "openclaw", "hermes", "agentskills"],
       "packages": {
         "claude": { "path": "." },
         "codex": { "path": "packages/codex/mlx-agent" },
+        "agy": { "path": "providers/agy" },
         "opencode": { "path": "providers/opencode" },
         "openclaw": { "path": "providers/agentskills" },
         "hermes": { "path": "providers/agentskills" },
@@ -22,11 +23,10 @@
       "repository": "cavi-ai/obsidian-agent",
       "license": "MIT",
       "summary": "Run portable, safety-gated Obsidian vault workflows through the official Obsidian CLI.",
-      "hosts": ["claude", "codex", "gemini", "opencode", "agentskills"],
+      "hosts": ["claude", "codex", "opencode", "agentskills"],
       "packages": {
         "claude": { "path": "." },
         "codex": { "path": "packages/codex/obsidian-agent" },
-        "gemini": { "path": "." },
         "opencode": { "path": "providers/opencode" },
         "agentskills": { "path": "providers/agentskills" }
       }
