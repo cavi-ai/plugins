@@ -30,6 +30,16 @@
         "opencode": { "path": "providers/opencode" },
         "agentskills": { "path": "providers/agentskills" }
       }
+    },
+    {
+      "name": "loop-killer",
+      "repository": "cavi-ai/loop-killer",
+      "license": "MIT",
+      "summary": "End stop-hook re-prompt loops by clearing the active goal.",
+      "hosts": ["claude"],
+      "packages": {
+        "claude": { "path": "." }
+      }
     }
   ]
 }
