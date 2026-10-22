@@ -1,4 +1,4 @@
-name: Sync Codex package
+name: Sync plugin release
 
 on:
   repository_dispatch:
@@ -6,24 +6,24 @@ on:
   workflow_dispatch:
     inputs:
       name:
-        description: Plugin whose Codex package to vendor
+        description: Catalog plugin that released
         required: true
         type: choice
-        options: [mlx-agent, obsidian-agent]
+        options: [mlx-agent, obsidian-agent, loop-killer]
       tag:
-        description: Release tag to vendor, for example v0.10.0
+        description: Release tag, for example v0.10.0
         required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: sync-codex-package-${{ github.event.client_payload.slug || inputs.name }}
+  group: sync-plugin-release-${{ github.event.client_payload.slug || inputs.name }}
   cancel-in-progress: false
 
 jobs:
   sync:
-    if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["mlx-agent","obsidian-agent"]'), github.event.client_payload.slug)
+    if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["mlx-agent","obsidian-agent","loop-killer"]'), github.event.client_payload.slug)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -54,12 +54,12 @@ jobs:
         with:
           node-version: 22
 
-      - name: Vendor the tagged package
+      - name: Point every host at the release
         run: |
           set -euo pipefail
           resolved="$(git -C .upstream rev-parse HEAD)"
           if [ -n "$COMMIT" ] && [ "$resolved" != "$COMMIT" ]; then echo "$TAG resolves to $resolved, not $COMMIT"; exit 1; fi
-          node scripts/sync-codex-package.mjs --name "$NAME" --source .upstream --commit "$resolved"
+          node scripts/sync-release.mjs --name "$NAME" --source .upstream --tag "$TAG" --commit "$resolved"
           rm -rf .upstream
           node --test
           node scripts/validate-catalog.mjs
@@ -71,24 +71,24 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          if [ -z "$(git status --porcelain -- packages/codex)" ]; then echo "packages/codex/$NAME already matches $TAG"; exit 0; fi
+          if [ -z "$(git status --porcelain)" ]; then echo "The catalog already points $NAME at $TAG"; exit 0; fi
           branch="sync/$NAME-$TAG"
           if git ls-remote --exit-code --heads origin "$branch" > /dev/null; then echo "Branch $branch already exists"; exit 1; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
-          git add -A -- packages/codex
-          git commit -m "chore: vendor $NAME $TAG Codex package"
+          git add -A -- releases.json .claude-plugin providers packages
+          git commit -m "chore: sync $NAME $TAG"
           git push origin "$branch"
           body="$(mktemp)"
           {
             echo "## Changes"
             echo
-            echo "- \`packages/codex/$NAME\` mirrors \`cavi-ai/$NAME\` \`$TAG\` (\`$RESOLVED\`)."
-            echo "- \`packages/codex/expected-integrity.json\` pins that commit, its tree hash and skill inventory."
+            echo "- \`releases.json\` pins \`cavi-ai/$NAME\` to \`$TAG\` (\`$RESOLVED\`)."
+            echo "- Every host projection of $NAME installs that release: the Claude marketplace source, each discovery install command and, when the plugin ships one, the vendored Codex package."
             echo
             echo "## Verification"
             echo
             echo "- \`node --test\` and \`node scripts/validate-catalog.mjs\` passed in $RUN_URL."
           } > "$body"
-          gh pr create --base main --head "$branch" --title "chore: vendor $NAME $TAG" --body-file "$body"
+          gh pr create --base main --head "$branch" --title "chore: sync $NAME $TAG" --body-file "$body"

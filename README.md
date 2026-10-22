@@ -12,6 +12,17 @@
 
 The machine-readable source of truth is [`catalog.json`](catalog.json). Claude and Codex consume native marketplace projections. Agy, OpenCode, OpenClaw, and Hermes use the discovery records under `providers/`, which link to each source repository's tested installer; those files do not claim a native marketplace protocol. Portable AgentSkills packages remain available from each plugin repository.
 
+## Releases
+
+[`releases.json`](releases.json) pins each released plugin to one tag and commit, and every host installs that release: the Claude marketplace source carries the tag as `ref` and the commit as `sha`, each discovery install command clones the tag, and the Codex package is copied from it. `loop-killer` has no release yet, so its Claude source follows the default branch.
+
+A plugin's release workflow sends a `cavi-oss-release` dispatch. [Sync plugin release](.github/workflows/sync-plugin-release.yml) checks out the tag, confirms it resolves to the released commit, points every host at it with `scripts/sync-release.mjs`, runs the catalog gate and opens a pull request. The same workflow runs by hand from the Actions tab with a plugin name and tag. Locally:
+
+```sh
+node scripts/sync-release.mjs --name mlx-agent --source <checkout at the tag> --tag <release tag> --commit <full commit>
+node --test && node scripts/validate-catalog.mjs
+```
+
 ## Claude Code
 
 Add the marketplace, then install a plugin:
@@ -33,25 +44,14 @@ codex plugin add mlx-agent@cavi-ai
 codex plugin add obsidian-agent@cavi-ai
 ```
 
-The Codex projection at [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json) uses Codex's documented marketplace-local source layout. `packages/codex/` contains minimal, self-contained projections copied from exact upstream commits. Each package includes provenance and a deterministic tree hash; catalog validation rejects local drift.
-
-These package projections are distribution artifacts, not independent workflow sources. Product development remains in the linked plugin repository.
-
-A plugin release refreshes its package. The plugin's release workflow sends a `cavi-oss-release` dispatch, and [Sync Codex package](.github/workflows/sync-codex-package.yml) checks out the tag, confirms it resolves to the released commit, vendors it with `scripts/sync-codex-package.mjs`, runs the catalog gate and opens a pull request. The same workflow runs by hand from the Actions tab with a plugin name and tag. Locally:
-
-```sh
-node scripts/sync-codex-package.mjs --name mlx-agent --source <checkout at the tag> --commit <full commit>
-node --test && node scripts/validate-catalog.mjs
-```
-
-`packages/codex/expected-integrity.json` pins each package's source commit, tree hash and skill inventory; `provenance.json` inside the package must agree with it.
+The Codex projection at [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json) uses Codex's documented marketplace-local source layout, so `packages/codex/` holds a self-contained copy of each release's Codex package. These copies are distribution artifacts, not independent workflow sources; product development remains in the linked plugin repository. `packages/codex/expected-integrity.json` pins each copy's release commit, tree hash and skill inventory, `provenance.json` inside the package must agree with it, and validation rejects local drift.
 
 ## Agy
 
-Agy discovery metadata is in [`providers/agy/catalog.json`](providers/agy/catalog.json). Each entry records the source repository's native installation command:
+Agy discovery metadata is in [`providers/agy/catalog.json`](providers/agy/catalog.json). Each entry records the source repository's native installation command for the pinned release:
 
 ```sh
-git clone https://github.com/cavi-ai/mlx-agent.git
+git clone --branch <release tag> --depth 1 https://github.com/cavi-ai/mlx-agent.git
 agy plugin install ./mlx-agent/providers/agy
 ```
 
@@ -62,10 +62,10 @@ The discovery catalog itself does not install anything. `obsidian-agent` does no
 OpenCode discovery metadata is in [`providers/opencode/catalog.json`](providers/opencode/catalog.json). Both source repositories provide preview-first installers:
 
 ```sh
-git clone https://github.com/cavi-ai/mlx-agent.git
+git clone --branch <release tag> --depth 1 https://github.com/cavi-ai/mlx-agent.git
 python3 mlx-agent/scripts/mlx-agent install opencode --scope user --dry-run --json
 
-git clone https://github.com/cavi-ai/obsidian-agent.git
+git clone --branch <release tag> --depth 1 https://github.com/cavi-ai/obsidian-agent.git
 node obsidian-agent/scripts/install.mjs --host opencode --scope user --dry-run
 ```
 
@@ -76,7 +76,7 @@ Review the destination paths and use the exact preview hash when confirming.
 OpenClaw and Hermes discovery metadata is in [`providers/openclaw/catalog.json`](providers/openclaw/catalog.json) and [`providers/hermes/catalog.json`](providers/hermes/catalog.json). The `mlx-agent` installer places its skills in `$OPENCLAW_STATE_DIR/skills` or `$HERMES_HOME/skills`:
 
 ```sh
-git clone https://github.com/cavi-ai/mlx-agent.git
+git clone --branch <release tag> --depth 1 https://github.com/cavi-ai/mlx-agent.git
 python3 mlx-agent/scripts/mlx-agent install openclaw --scope user --dry-run --json
 python3 mlx-agent/scripts/mlx-agent install hermes --scope user --dry-run --json
 ```
@@ -96,4 +96,4 @@ node --test
 node scripts/validate-catalog.mjs
 ```
 
-Validation rejects identity drift, unknown hosts, packages for undeclared hosts, duplicate entries, non-plugin products, and projections that disagree with the canonical host list, repository, or package path.
+Validation rejects identity drift, unknown hosts, packages for undeclared hosts, duplicate entries, non-plugin products, projections that disagree with the canonical host list, repository, or package path, and any host projection that does not install the plugin's pinned release.

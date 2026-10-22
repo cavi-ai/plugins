@@ -7,7 +7,9 @@
       "name": "mlx-agent",
       "repository": "cavi-ai/mlx-agent",
       "package": "providers/agentskills",
-      "install": { "command": "git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install hermes --scope user --dry-run --json" }
+      "install": {
+        "command": "git clone --branch v0.10.0 --depth 1 https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install hermes --scope user --dry-run --json"
+      }
     }
   ]
 }

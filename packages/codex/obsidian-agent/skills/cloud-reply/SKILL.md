@@ -1,0 +1,59 @@
+---
+name: cloud-reply
+description: Use when running as a dispatched cloud Claude Code session against an Obsidian vault repo — do the task, write the result back as a reply note, and open a PR so Companion can pull it into the vault on any device.
+portable: false
+---
+
+# Cloud reply
+
+> **Claude adapter only.** This workflow depends on Claude cloud sessions,
+> Companion reply polling, and GitHub pull requests. The official Obsidian CLI
+> cannot provide that transport. Keep it out of universal capability lists and
+> move it into the dedicated Claude adapter when that provider package lands.
+
+You are a cloud Claude Code session fired against an Obsidian vault that is this
+Git repo (e.g. via a Companion "Send to cloud session" routine). The user is
+usually on their phone and can't see your terminal — your **reply note + PR is
+the only way your work reaches them**, so land it where Companion looks.
+
+**REQUIRED SUB-SKILL:** obsidian-agent:vault-grounding
+
+## The discipline
+
+1. **Ground the work in the repo.** The task arrives as free text in the run
+   context. Read the actual notes before you assert anything (cite their paths);
+   the vault is the source of truth, not memory.
+2. **Write one reply note into the configured reply folder.** Companion polls a
+   folder the user configures (`cloudReplyFolder`); its default is
+   `Claude/Replies/`, but do not assume it. Look in the repo first — if a folder
+   already holds reply notes, use that one. Only fall back to `Claude/Replies/`
+   when the repo has none, and say in the PR body which folder you chose. A reply
+   written to the wrong folder is invisible to the user.
+   Name it in kebab-case from the task (e.g. `weekly-decisions-rollup.md`), with
+   YAML frontmatter: `title`, `created` (YYYY-MM-DD), `source: claude-cloud`, and
+   `tags` (reuse the vault's existing tags). Keep the body skimmable: what you
+   did, key findings (with `[[wikilinks]]` to the notes), and any follow-ups.
+3. **Keep all changes in one commit on a reply branch.** If the task also
+   created or edited other notes, include them. Commit to a new branch
+   `claude/reply-<slug>` — never push to `main`.
+4. **Open a pull request** titled after the task. The PR is the review gate: the
+   user merges it, the reply note lands on `main`, and Companion's "Pull cloud
+   session replies" fetches it onto their device.
+5. **Blocked is honest.** If you can't finish, still write the reply note saying
+   what's blocked and why, and open the PR — a blocked run must not go silent.
+
+## Hard requirements
+
+- The reply note lives in the repo's existing reply folder (default
+  `Claude/Replies/`) with valid frontmatter, and the PR body names the folder used.
+- Work reaches the user as a **PR**, not a direct push to `main`.
+- Every claim about the vault traces to a note you actually read.
+
+## Common mistakes
+
+- Doing great work but leaving no reply note — the user sees nothing.
+- Pushing to `main` instead of a `claude/reply-<slug>` branch + PR.
+- Inventing vault facts from memory instead of reading the notes.
+- A reply note with no frontmatter (it won't index cleanly in the vault).
+- Hardcoding `Claude/Replies/` when the user configured a different reply folder —
+  the reply lands where Companion isn't looking and the user sees nothing.
