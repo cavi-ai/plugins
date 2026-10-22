@@ -10,15 +10,16 @@ export const MARKETPLACE = "cavi-ai";
 // Every plugin the catalog may list. REQUIRED is the subset that must be present and ships a pinned Codex package.
 const CANONICAL = ["mlx-agent", "obsidian-agent", "loop-killer"];
 const REQUIRED = ["mlx-agent", "obsidian-agent"];
-const INCLUDED_ROOTS = [".codex-plugin", "skills"];
-const SKILL_INVENTORIES = {
-  "mlx-agent": ["mlx-adopt", "mlx-bench", "mlx-scout", "mlx-wire"],
-  "obsidian-agent": ["build-retrospective", "connection-finder", "consistent-tagging", "daily-rollup", "dedup-merge", "frontmatter-normalizer", "manifest-content", "manifest-core", "manifest-feature", "manifest-infra", "manifest-pm", "manifest-research", "manifest-risk", "manifest-vault", "meeting-cleanup", "moc-builder", "note-splitter", "outline-to-draft", "plan-to-spec", "source-digest", "summarize-and-link", "task-harvester", "tracker-driver", "vault-grounding", "vault-synthesis", "wikilink-weaver"]
+// What each pinned Codex package mirrors from its source repository. The pinned commit, tree and skills live in packages/codex/expected-integrity.json.
+export const CODEX_PACKAGES = {
+  "mlx-agent": {
+    sourcePath: "providers/codex",
+    included: [".codex-plugin", "requirements-lab-inference.txt", "requirements-lab.txt", "scripts", "skills", "src"],
+    excluded: ["scripts/mlx-agent-mcp", "src/mlx_agent/mcp_server.py"],
+    exclusionReason: "Codex skills use the packaged CLI entrypoint; MCP transport artifacts are not required or distributed by this catalog."
+  },
+  "obsidian-agent": { sourcePath: ".", included: [".codex-plugin", "skills"] }
 };
-const SOURCE_COMMITS = { "mlx-agent": "923627988cf98e984fa36e0b940f86e7263e2958", "obsidian-agent": "7efecb058fce8185056cbe7868d6de1af11879a9" };
-const SOURCE_PATHS = { "mlx-agent": "providers/codex", "obsidian-agent": "." };
-const MLX_EXCLUDED = [".mlx-agent-generated-files.json", "skills/*/scripts/mlx-agent-mcp", "skills/*/src/mlx_agent/mcp_server.py"];
-const MLX_EXCLUSION_REASON = "Codex skills use the packaged CLI entrypoint; MCP transport artifacts are not required or distributed by this catalog.";
 const DISCOVERY_COMMANDS = {
   agy: {
     "mlx-agent": "git clone https://github.com/cavi-ai/mlx-agent.git && agy plugin install ./mlx-agent/providers/agy"
@@ -75,10 +76,11 @@ async function filesUnder(directory, symlinks = [], nonregular = []) {
   return nested.flat();
 }
 
-async function packageTreeHash(packageRoot, included) {
+export async function packageTreeHash(packageRoot, included) {
   const hash = createHash("sha256");
   for (const base of included) {
-    const files = (await filesUnder(path.join(packageRoot, base))).sort();
+    const target = path.join(packageRoot, base);
+    const files = (await lstat(target)).isFile() ? [target] : (await filesUnder(target)).sort();
     for (const file of files) {
       hash.update(path.relative(packageRoot, file));
       hash.update("\0");
@@ -147,11 +149,13 @@ function validateTrustedIntegrity(registry, errors) {
     if (!Object.hasOwn(registry, name)) { errors.push(`trusted integrity registry missing package: ${name}`); continue; }
     const record = registry[name];
     if (!record || typeof record !== "object" || Array.isArray(record)) { errors.push(`trusted integrity ${name} must be an object`); continue; }
-    for (const key of unknownKeys(record, ["repository", "source_commit", "source_path", "tree"])) errors.push(`trusted integrity ${name} unexpected property: ${key}`);
+    for (const key of unknownKeys(record, ["repository", "source_commit", "source_path", "tree", "skills"])) errors.push(`trusted integrity ${name} unexpected property: ${key}`);
     if (record.repository !== `cavi-ai/${name}`) errors.push(`trusted integrity ${name} repository mismatch`);
-    if (record.source_commit !== SOURCE_COMMITS[name]) errors.push(`trusted integrity ${name} source_commit mismatch`);
-    if (record.source_path !== SOURCE_PATHS[name]) errors.push(`trusted integrity ${name} source_path mismatch`);
+    if (typeof record.source_commit !== "string" || !/^[0-9a-f]{40}$/.test(record.source_commit)) errors.push(`trusted integrity ${name} source_commit must be a full lowercase commit`);
+    if (record.source_path !== CODEX_PACKAGES[name].sourcePath) errors.push(`trusted integrity ${name} source_path mismatch`);
     if (typeof record.tree !== "string" || !/^[0-9a-f]{64}$/.test(record.tree)) errors.push(`trusted integrity ${name} tree must be 64 lowercase hexadecimal characters`);
+    const skills = record.skills;
+    if (!Array.isArray(skills) || !skills.length || skills.some((skill) => typeof skill !== "string" || !/^[a-z0-9-]+$/.test(skill)) || JSON.stringify(skills) !== JSON.stringify([...new Set(skills)].sort())) errors.push(`trusted integrity ${name} skills must be sorted unique skill names`);
   }
 }
 
@@ -205,25 +209,27 @@ async function validateCodexPackage(root, raw, canonical, trustedIntegrity, erro
     const provenance = JSON.parse(await readFile(path.join(packageRoot, "provenance.json"), "utf8"));
     const manifest = JSON.parse(await readFile(path.join(packageRoot, ".codex-plugin/plugin.json"), "utf8"));
     if (manifest.name !== raw.name) errors.push(`codex package manifest mismatch: ${raw.name}`);
+    const config = CODEX_PACKAGES[raw.name];
+    if (!config) { errors.push(`codex package has no pinned configuration: ${raw.name}`); return; }
     if (provenance.repository !== canonical.repository) errors.push(`codex package provenance repository mismatch: ${raw.name}`);
-    if (provenance.source_commit !== SOURCE_COMMITS[raw.name]) errors.push(`codex package source commit mismatch: ${raw.name}`);
-    if (provenance.source_path !== SOURCE_PATHS[raw.name]) errors.push(`codex package source path mismatch: ${raw.name}`);
-    const provenanceKeys = raw.name === "mlx-agent" ? ["repository", "source_commit", "source_path", "included", "excluded", "exclusion_reason", "integrity"] : ["repository", "source_commit", "source_path", "included", "integrity"];
+    if (provenance.source_commit !== trustedIntegrity?.source_commit) errors.push(`codex package source commit mismatch: ${raw.name}`);
+    if (provenance.source_path !== config.sourcePath) errors.push(`codex package source path mismatch: ${raw.name}`);
+    const provenanceKeys = config.excluded ? ["repository", "source_commit", "source_path", "included", "excluded", "exclusion_reason", "integrity"] : ["repository", "source_commit", "source_path", "included", "integrity"];
     if (unknownKeys(provenance, provenanceKeys).length || unknownKeys(provenance.integrity, ["algorithm", "tree"]).length) errors.push(`codex package provenance shape invalid: ${raw.name}`);
-    if (raw.name === "mlx-agent" && (JSON.stringify(provenance.excluded) !== JSON.stringify(MLX_EXCLUDED) || provenance.exclusion_reason !== MLX_EXCLUSION_REASON)) errors.push("codex package exclusions mismatch: mlx-agent");
-    if (JSON.stringify(provenance.included) !== JSON.stringify(INCLUDED_ROOTS)) errors.push(`codex package included roots mismatch: ${raw.name}`);
-    if (!trustedIntegrity || trustedIntegrity.repository !== canonical.repository || trustedIntegrity.source_commit !== SOURCE_COMMITS[raw.name] || trustedIntegrity.source_path !== SOURCE_PATHS[raw.name] || typeof trustedIntegrity.tree !== "string") errors.push(`codex package trusted integrity invalid: ${raw.name}`);
+    if (config.excluded && (JSON.stringify(provenance.excluded) !== JSON.stringify(config.excluded) || provenance.exclusion_reason !== config.exclusionReason)) errors.push(`codex package exclusions mismatch: ${raw.name}`);
+    if (JSON.stringify(provenance.included) !== JSON.stringify(config.included)) errors.push(`codex package included roots mismatch: ${raw.name}`);
+    if (!trustedIntegrity || trustedIntegrity.repository !== canonical.repository || trustedIntegrity.source_path !== config.sourcePath || typeof trustedIntegrity.tree !== "string") errors.push(`codex package trusted integrity invalid: ${raw.name}`);
     if (provenance.integrity?.algorithm !== "sha256" || !Array.isArray(provenance.included)) {
       errors.push(`codex package integrity metadata invalid: ${raw.name}`);
     } else if (symlinks.length === 0 && nonregular.length === 0) {
-      const actualTree = await packageTreeHash(packageRoot, INCLUDED_ROOTS);
+      const actualTree = await packageTreeHash(packageRoot, config.included);
       if (actualTree !== provenance.integrity.tree) errors.push(`codex package integrity mismatch: ${raw.name}`);
       if (actualTree !== trustedIntegrity?.tree) errors.push(`codex package upstream digest mismatch: ${raw.name}`);
     }
-    const allowedTop = new Set([".codex-plugin", "skills", "provenance.json"]);
+    const allowedTop = new Set([...config.included, "provenance.json"]);
     for (const item of await readdir(packageRoot)) if (!allowedTop.has(item)) errors.push(`codex package unexpected root entry: ${raw.name}: ${item}`);
     const skills = (await readdir(path.join(packageRoot, "skills"), { withFileTypes: true })).filter((item) => item.isDirectory()).map((item) => item.name).sort();
-    if (JSON.stringify(skills) !== JSON.stringify(SKILL_INVENTORIES[raw.name])) errors.push(`codex package skill inventory mismatch: ${raw.name}`);
+    if (JSON.stringify(skills) !== JSON.stringify(trustedIntegrity?.skills)) errors.push(`codex package skill inventory mismatch: ${raw.name}`);
     if (!packageFiles.some((file) => /\/skills\/[^/]+\/SKILL\.md$/.test(file))) errors.push(`codex package has no skills: ${raw.name}`);
     if (packageFiles.some((file) => path.basename(file) === ".mcp.json" || path.basename(file) === "mlx-agent-mcp" || path.basename(file) === "mcp_server.py")) {
       errors.push(`codex package contains MCP transport: ${raw.name}`);

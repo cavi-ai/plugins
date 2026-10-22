@@ -35,7 +35,16 @@ codex plugin add obsidian-agent@cavi-ai
 
 The Codex projection at [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json) uses Codex's documented marketplace-local source layout. `packages/codex/` contains minimal, self-contained projections copied from exact upstream commits. Each package includes provenance and a deterministic tree hash; catalog validation rejects local drift.
 
-These package projections are distribution artifacts, not independent workflow sources. Refresh one only from a reviewed upstream commit, update its `provenance.json`, and run the full catalog gate. Product development remains in the linked plugin repository.
+These package projections are distribution artifacts, not independent workflow sources. Product development remains in the linked plugin repository.
+
+A plugin release refreshes its package. The plugin's release workflow sends a `cavi-oss-release` dispatch, and [Sync Codex package](.github/workflows/sync-codex-package.yml) checks out the tag, confirms it resolves to the released commit, vendors it with `scripts/sync-codex-package.mjs`, runs the catalog gate and opens a pull request. The same workflow runs by hand from the Actions tab with a plugin name and tag. Locally:
+
+```sh
+node scripts/sync-codex-package.mjs --name mlx-agent --source <checkout at the tag> --commit <full commit>
+node --test && node scripts/validate-catalog.mjs
+```
+
+`packages/codex/expected-integrity.json` pins each package's source commit, tree hash and skill inventory; `provenance.json` inside the package must agree with it.
 
 ## Agy
 

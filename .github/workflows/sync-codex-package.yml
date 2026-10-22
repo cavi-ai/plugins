@@ -1,0 +1,94 @@
+name: Sync Codex package
+
+on:
+  repository_dispatch:
+    types: [cavi-oss-release]
+  workflow_dispatch:
+    inputs:
+      name:
+        description: Plugin whose Codex package to vendor
+        required: true
+        type: choice
+        options: [mlx-agent, obsidian-agent]
+      tag:
+        description: Release tag to vendor, for example v0.10.0
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-codex-package-${{ github.event.client_payload.slug || inputs.name }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["mlx-agent","obsidian-agent"]'), github.event.client_payload.slug)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      NAME: ${{ github.event.client_payload.slug || inputs.name }}
+      TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+      COMMIT: ${{ github.event.client_payload.commit || '' }}
+      REPOSITORY: ${{ github.event.client_payload.repository || '' }}
+    steps:
+      - name: Check the release identity
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "Tag must be vX.Y.Z: $TAG"; exit 1; }
+          if [ -n "$REPOSITORY" ] && [ "$REPOSITORY" != "cavi-ai/$NAME" ]; then echo "Repository $REPOSITORY does not match $NAME"; exit 1; fi
+          if [ -n "$COMMIT" ] && ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then echo "Commit must be a full lowercase SHA: $COMMIT"; exit 1; fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: cavi-ai/${{ env.NAME }}
+          ref: refs/tags/${{ env.TAG }}
+          path: .upstream
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Vendor the tagged package
+        run: |
+          set -euo pipefail
+          resolved="$(git -C .upstream rev-parse HEAD)"
+          if [ -n "$COMMIT" ] && [ "$resolved" != "$COMMIT" ]; then echo "$TAG resolves to $resolved, not $COMMIT"; exit 1; fi
+          node scripts/sync-codex-package.mjs --name "$NAME" --source .upstream --commit "$resolved"
+          rm -rf .upstream
+          node --test
+          node scripts/validate-catalog.mjs
+          echo "RESOLVED=$resolved" >> "$GITHUB_ENV"
+
+      - name: Open a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain -- packages/codex)" ]; then echo "packages/codex/$NAME already matches $TAG"; exit 0; fi
+          branch="sync/$NAME-$TAG"
+          if git ls-remote --exit-code --heads origin "$branch" > /dev/null; then echo "Branch $branch already exists"; exit 1; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add -A -- packages/codex
+          git commit -m "chore: vendor $NAME $TAG Codex package"
+          git push origin "$branch"
+          body="$(mktemp)"
+          {
+            echo "## Changes"
+            echo
+            echo "- \`packages/codex/$NAME\` mirrors \`cavi-ai/$NAME\` \`$TAG\` (\`$RESOLVED\`)."
+            echo "- \`packages/codex/expected-integrity.json\` pins that commit, its tree hash and skill inventory."
+            echo
+            echo "## Verification"
+            echo
+            echo "- \`node --test\` and \`node scripts/validate-catalog.mjs\` passed in $RUN_URL."
+          } > "$body"
+          gh pr create --base main --head "$branch" --title "chore: vendor $NAME $TAG" --body-file "$body"

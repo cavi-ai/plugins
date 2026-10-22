@@ -29,10 +29,15 @@ function plugin(name, repository = `cavi-ai/${name}`, supportedHosts = pluginHos
   };
 }
 
-async function fixtureTreeHash(packageRoot) {
-  const walk = async (directory) => (await Promise.all((await readdir(directory, { withFileTypes: true })).map(async (item) => item.isDirectory() ? walk(path.join(directory, item.name)) : [path.join(directory, item.name)]))).flat();
+const includedRoots = {
+  "mlx-agent": [".codex-plugin", "requirements-lab-inference.txt", "requirements-lab.txt", "scripts", "skills", "src"],
+  "obsidian-agent": [".codex-plugin", "skills"]
+};
+
+async function fixtureTreeHash(packageRoot, roots = includedRoots[path.basename(packageRoot)]) {
+  const walk = async (target) => (await stat(target)).isFile() ? [target] : (await Promise.all((await readdir(target, { withFileTypes: true })).map(async (item) => item.isDirectory() ? walk(path.join(target, item.name)) : [path.join(target, item.name)]))).flat();
   const hash = createHash("sha256");
-  for (const base of [".codex-plugin", "skills"]) for (const file of (await walk(path.join(packageRoot, base))).sort()) {
+  for (const base of roots) for (const file of (await walk(path.join(packageRoot, base))).sort()) {
     hash.update(path.relative(packageRoot, file)); hash.update("\0"); hash.update(await readFile(file)); hash.update("\0");
   }
   return hash.digest("hex");
@@ -46,7 +51,15 @@ async function createFixturePackage(root, name) {
     await mkdir(path.join(packageRoot, "skills", skill), { recursive: true });
     await writeFile(path.join(packageRoot, "skills", skill, "SKILL.md"), `---\nname: ${skill}\ndescription: fixture\n---\n`);
   }
-  await writeFile(path.join(packageRoot, "provenance.json"), JSON.stringify({ repository: `cavi-ai/${name}`, source_commit: sourceCommits[name], source_path: name === "mlx-agent" ? "providers/codex" : ".", included: [".codex-plugin", "skills"], ...(name === "mlx-agent" ? { excluded: [".mlx-agent-generated-files.json", "skills/*/scripts/mlx-agent-mcp", "skills/*/src/mlx_agent/mcp_server.py"], exclusion_reason: "Codex skills use the packaged CLI entrypoint; MCP transport artifacts are not required or distributed by this catalog." } : {}), integrity: { algorithm: "sha256", tree: await fixtureTreeHash(packageRoot) } }));
+  if (name === "mlx-agent") {
+    await mkdir(path.join(packageRoot, "scripts"), { recursive: true });
+    await mkdir(path.join(packageRoot, "src/mlx_agent"), { recursive: true });
+    await writeFile(path.join(packageRoot, "scripts/mlx-agent"), "#!/usr/bin/env python3\n");
+    await writeFile(path.join(packageRoot, "src/mlx_agent/__init__.py"), "__version__ = \"1.0.0\"\n");
+    await writeFile(path.join(packageRoot, "requirements-lab.txt"), "fixture==1\n");
+    await writeFile(path.join(packageRoot, "requirements-lab-inference.txt"), "fixture==1\n");
+  }
+  await writeFile(path.join(packageRoot, "provenance.json"), JSON.stringify({ repository: `cavi-ai/${name}`, source_commit: sourceCommits[name], source_path: name === "mlx-agent" ? "providers/codex" : ".", included: includedRoots[name], ...(name === "mlx-agent" ? { excluded: ["scripts/mlx-agent-mcp", "src/mlx_agent/mcp_server.py"], exclusion_reason: "Codex skills use the packaged CLI entrypoint; MCP transport artifacts are not required or distributed by this catalog." } : {}), integrity: { algorithm: "sha256", tree: await fixtureTreeHash(packageRoot) } }));
 }
 
 async function fixture({ catalog, claude = [], codex = [], agy = [], opencode = [], openclaw = [], hermes = [] }) {
@@ -68,7 +81,7 @@ async function fixture({ catalog, claude = [], codex = [], agy = [], opencode = 
   const expectedIntegrity = {};
   for (const name of Object.keys(inventories)) {
     const provenance = JSON.parse(await readFile(path.join(root, `packages/codex/${name}/provenance.json`), "utf8"));
-    expectedIntegrity[name] = { repository: provenance.repository, source_commit: provenance.source_commit, source_path: provenance.source_path, tree: provenance.integrity.tree };
+    expectedIntegrity[name] = { repository: provenance.repository, source_commit: provenance.source_commit, source_path: provenance.source_path, tree: provenance.integrity.tree, skills: inventories[name] };
   }
   await writeFile(path.join(root, "packages/codex/expected-integrity.json"), JSON.stringify(expectedIntegrity));
   return root;
@@ -395,7 +408,10 @@ test("requires a closed and fully typed trusted-integrity registry", async () =>
     [(registry) => { registry["mlx-agent"].extra = true; }, "trusted integrity mlx-agent unexpected property: extra"],
     [(registry) => { delete registry["mlx-agent"].source_path; }, "trusted integrity mlx-agent source_path mismatch"],
     [(registry) => { registry["obsidian-agent"].tree = "A".repeat(64); }, "trusted integrity obsidian-agent tree must be 64 lowercase hexadecimal characters"],
-    [(registry) => { registry["obsidian-agent"].tree = "0".repeat(63); }, "trusted integrity obsidian-agent tree must be 64 lowercase hexadecimal characters"]
+    [(registry) => { registry["obsidian-agent"].tree = "0".repeat(63); }, "trusted integrity obsidian-agent tree must be 64 lowercase hexadecimal characters"],
+    [(registry) => { registry["mlx-agent"].source_commit = "main"; }, "trusted integrity mlx-agent source_commit must be a full lowercase commit"],
+    [(registry) => { registry["mlx-agent"].skills = ["mlx-wire", "mlx-adopt"]; }, "trusted integrity mlx-agent skills must be sorted unique skill names"],
+    [(registry) => { delete registry["obsidian-agent"].skills; }, "trusted integrity obsidian-agent skills must be sorted unique skill names"]
   ];
   for (const [mutateOrValue, expected] of cases) {
     const root = await fixture({ catalog: canonical });
