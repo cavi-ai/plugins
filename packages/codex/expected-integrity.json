@@ -1,14 +1,56 @@
 {
   "mlx-agent": {
     "repository": "cavi-ai/mlx-agent",
-    "source_commit": "923627988cf98e984fa36e0b940f86e7263e2958",
+    "source_commit": "6e6effd57bc4fce90760d938a939aef1f18e1f49",
     "source_path": "providers/codex",
-    "tree": "c3fd7577d32e4c179d510516117a2405f80dd67e5693fd7b9835d6b84ed62d3c"
+    "tree": "f28e977491c286ed9b33eaae08a945daa188e899cabb1a980f84879e01351158",
+    "skills": [
+      "mlx-adopt",
+      "mlx-bench",
+      "mlx-doctor",
+      "mlx-fleet",
+      "mlx-scout",
+      "mlx-watch",
+      "mlx-wire"
+    ]
   },
   "obsidian-agent": {
     "repository": "cavi-ai/obsidian-agent",
-    "source_commit": "7efecb058fce8185056cbe7868d6de1af11879a9",
+    "source_commit": "b0b0cf03658b4f74c632db54834cb9add337c40a",
     "source_path": ".",
-    "tree": "e4b9ecdc9d7d76011d955784f64d2b2f2074e5c776b5411d9fc332dd07734df2"
+    "tree": "b1cc6f52489f22b76d6b1700060302e11ce335ee841fa8af8ce38dcbf96c9c7a",
+    "skills": [
+      "build-retrospective",
+      "cloud-reply",
+      "connection-finder",
+      "consistent-tagging",
+      "daily-rollup",
+      "dedup-merge",
+      "frontmatter-normalizer",
+      "manifest-content",
+      "manifest-core",
+      "manifest-feature",
+      "manifest-infra",
+      "manifest-pm",
+      "manifest-research",
+      "manifest-risk",
+      "manifest-vault",
+      "meeting-cleanup",
+      "moc-builder",
+      "note-splitter",
+      "note-to-artifact",
+      "outline-to-draft",
+      "plan-to-spec",
+      "research-workbench",
+      "session-to-note",
+      "source-digest",
+      "summarize-and-link",
+      "task-harvester",
+      "tracker-driver",
+      "vault-grounding",
+      "vault-routines",
+      "vault-synthesis",
+      "wikilink-weaver"
+    ]
   }
 }

@@ -7,7 +7,9 @@
       "name": "mlx-agent",
       "repository": "cavi-ai/mlx-agent",
       "package": "providers/agy",
-      "install": { "command": "git clone https://github.com/cavi-ai/mlx-agent.git && agy plugin install ./mlx-agent/providers/agy" }
+      "install": {
+        "command": "git clone --branch v0.10.0 --depth 1 https://github.com/cavi-ai/mlx-agent.git && agy plugin install ./mlx-agent/providers/agy"
+      }
     }
   ]
 }

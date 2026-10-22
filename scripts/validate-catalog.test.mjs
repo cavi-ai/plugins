@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { MARKETPLACE, validateCatalog } from "./validate-catalog.mjs";
+import { MARKETPLACE, claudeSource, discoveryInstallCommand, validateCatalog } from "./validate-catalog.mjs";
 
 const hosts = ["claude", "codex", "agy", "opencode", "openclaw", "hermes", "agentskills"];
 const inventories = {
@@ -13,6 +13,7 @@ const inventories = {
   "obsidian-agent": ["build-retrospective", "connection-finder", "consistent-tagging", "daily-rollup", "dedup-merge", "frontmatter-normalizer", "manifest-content", "manifest-core", "manifest-feature", "manifest-infra", "manifest-pm", "manifest-research", "manifest-risk", "manifest-vault", "meeting-cleanup", "moc-builder", "note-splitter", "outline-to-draft", "plan-to-spec", "source-digest", "summarize-and-link", "task-harvester", "tracker-driver", "vault-grounding", "vault-synthesis", "wikilink-weaver"]
 };
 const sourceCommits = { "mlx-agent": "923627988cf98e984fa36e0b940f86e7263e2958", "obsidian-agent": "7efecb058fce8185056cbe7868d6de1af11879a9" };
+const releases = { "mlx-agent": { tag: "v1.0.0", commit: sourceCommits["mlx-agent"] }, "obsidian-agent": { tag: "v1.0.0", commit: sourceCommits["obsidian-agent"] } };
 const pluginHosts = {
   "mlx-agent": ["claude", "codex", "agy", "opencode", "openclaw", "hermes", "agentskills"],
   "obsidian-agent": ["claude", "codex", "opencode", "agentskills"]
@@ -29,10 +30,15 @@ function plugin(name, repository = `cavi-ai/${name}`, supportedHosts = pluginHos
   };
 }
 
-async function fixtureTreeHash(packageRoot) {
-  const walk = async (directory) => (await Promise.all((await readdir(directory, { withFileTypes: true })).map(async (item) => item.isDirectory() ? walk(path.join(directory, item.name)) : [path.join(directory, item.name)]))).flat();
+const includedRoots = {
+  "mlx-agent": [".codex-plugin", "requirements-lab-inference.txt", "requirements-lab.txt", "scripts", "skills", "src"],
+  "obsidian-agent": [".codex-plugin", "skills"]
+};
+
+async function fixtureTreeHash(packageRoot, roots = includedRoots[path.basename(packageRoot)]) {
+  const walk = async (target) => (await stat(target)).isFile() ? [target] : (await Promise.all((await readdir(target, { withFileTypes: true })).map(async (item) => item.isDirectory() ? walk(path.join(target, item.name)) : [path.join(target, item.name)]))).flat();
   const hash = createHash("sha256");
-  for (const base of [".codex-plugin", "skills"]) for (const file of (await walk(path.join(packageRoot, base))).sort()) {
+  for (const base of roots) for (const file of (await walk(path.join(packageRoot, base))).sort()) {
     hash.update(path.relative(packageRoot, file)); hash.update("\0"); hash.update(await readFile(file)); hash.update("\0");
   }
   return hash.digest("hex");
@@ -46,7 +52,15 @@ async function createFixturePackage(root, name) {
     await mkdir(path.join(packageRoot, "skills", skill), { recursive: true });
     await writeFile(path.join(packageRoot, "skills", skill, "SKILL.md"), `---\nname: ${skill}\ndescription: fixture\n---\n`);
   }
-  await writeFile(path.join(packageRoot, "provenance.json"), JSON.stringify({ repository: `cavi-ai/${name}`, source_commit: sourceCommits[name], source_path: name === "mlx-agent" ? "providers/codex" : ".", included: [".codex-plugin", "skills"], ...(name === "mlx-agent" ? { excluded: [".mlx-agent-generated-files.json", "skills/*/scripts/mlx-agent-mcp", "skills/*/src/mlx_agent/mcp_server.py"], exclusion_reason: "Codex skills use the packaged CLI entrypoint; MCP transport artifacts are not required or distributed by this catalog." } : {}), integrity: { algorithm: "sha256", tree: await fixtureTreeHash(packageRoot) } }));
+  if (name === "mlx-agent") {
+    await mkdir(path.join(packageRoot, "scripts"), { recursive: true });
+    await mkdir(path.join(packageRoot, "src/mlx_agent"), { recursive: true });
+    await writeFile(path.join(packageRoot, "scripts/mlx-agent"), "#!/usr/bin/env python3\n");
+    await writeFile(path.join(packageRoot, "src/mlx_agent/__init__.py"), "__version__ = \"1.0.0\"\n");
+    await writeFile(path.join(packageRoot, "requirements-lab.txt"), "fixture==1\n");
+    await writeFile(path.join(packageRoot, "requirements-lab-inference.txt"), "fixture==1\n");
+  }
+  await writeFile(path.join(packageRoot, "provenance.json"), JSON.stringify({ repository: `cavi-ai/${name}`, source_commit: sourceCommits[name], source_path: name === "mlx-agent" ? "providers/codex" : ".", included: includedRoots[name], ...(name === "mlx-agent" ? { excluded: ["scripts/mlx-agent-mcp", "src/mlx_agent/mcp_server.py"], exclusion_reason: "Codex skills use the packaged CLI entrypoint; MCP transport artifacts are not required or distributed by this catalog." } : {}), integrity: { algorithm: "sha256", tree: await fixtureTreeHash(packageRoot) } }));
 }
 
 async function fixture({ catalog, claude = [], codex = [], agy = [], opencode = [], openclaw = [], hermes = [] }) {
@@ -56,7 +70,8 @@ async function fixture({ catalog, claude = [], codex = [], agy = [], opencode = 
   for (const host of ["agy", "opencode", "openclaw", "hermes"]) await mkdir(path.join(root, "providers", host), { recursive: true });
   await cp(path.resolve(new URL("../catalog.schema.json", import.meta.url).pathname), path.join(root, "catalog.schema.json"));
   await writeFile(path.join(root, "catalog.json"), JSON.stringify(catalog));
-  const nativeClaude = claude.map((item) => item.source ? item : { name: item.name, source: { source: "github", repo: item.repository }, description: `${item.name} fixture` });
+  await writeFile(path.join(root, "releases.json"), JSON.stringify(releases));
+  const nativeClaude = claude.map((item) => item.source ? item : { name: item.name, source: { ...claudeSource(item.name, releases[item.name]), repo: item.repository }, description: `${item.name} fixture` });
   const nativeCodex = codex.map((item) => item.source ? item : { name: item.name, source: { source: "local", path: `./packages/codex/${item.name}` }, policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" }, category: "Productivity" });
   await writeFile(path.join(root, ".claude-plugin/marketplace.json"), JSON.stringify({ name: MARKETPLACE, owner: { name: "Cavi AI", url: "https://github.com/cavi-ai" }, metadata: { description: "fixture" }, plugins: nativeClaude }));
   await writeFile(path.join(root, ".agents/plugins/marketplace.json"), JSON.stringify({ name: MARKETPLACE, interface: { displayName: "Cavi AI" }, plugins: nativeCodex }));
@@ -68,7 +83,7 @@ async function fixture({ catalog, claude = [], codex = [], agy = [], opencode = 
   const expectedIntegrity = {};
   for (const name of Object.keys(inventories)) {
     const provenance = JSON.parse(await readFile(path.join(root, `packages/codex/${name}/provenance.json`), "utf8"));
-    expectedIntegrity[name] = { repository: provenance.repository, source_commit: provenance.source_commit, source_path: provenance.source_path, tree: provenance.integrity.tree };
+    expectedIntegrity[name] = { repository: provenance.repository, source_commit: provenance.source_commit, source_path: provenance.source_path, tree: provenance.integrity.tree, skills: inventories[name] };
   }
   await writeFile(path.join(root, "packages/codex/expected-integrity.json"), JSON.stringify(expectedIntegrity));
   return root;
@@ -84,9 +99,48 @@ const entry = (name, host) => ({
   name,
   repository: `cavi-ai/${name}`,
   package: canonical.plugins.find((item) => item.name === name).packages[host].path,
-  ...(host === "agy" ? { install: { command: "git clone https://github.com/cavi-ai/mlx-agent.git && agy plugin install ./mlx-agent/providers/agy" } } : {}),
-  ...(host === "opencode" ? { install: { command: name === "mlx-agent" ? "git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install opencode --scope user --dry-run --json" : "git clone https://github.com/cavi-ai/obsidian-agent.git && node obsidian-agent/scripts/install.mjs --host opencode --scope user --dry-run" } } : {}),
-  ...(host === "openclaw" || host === "hermes" ? { install: { command: `git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install ${host} --scope user --dry-run --json` } } : {})
+  ...(["agy", "opencode", "openclaw", "hermes"].includes(host) ? { install: { command: discoveryInstallCommand(host, name, releases[name]) } } : {})
+});
+
+test("pins discovery installs and the Claude source to the released tag and commit", () => {
+  const release = { tag: "v1.2.3", commit: "b".repeat(40) };
+  assert.equal(discoveryInstallCommand("agy", "mlx-agent", release), "git clone --branch v1.2.3 --depth 1 https://github.com/cavi-ai/mlx-agent.git && agy plugin install ./mlx-agent/providers/agy");
+  assert.equal(discoveryInstallCommand("opencode", "obsidian-agent", release), "git clone --branch v1.2.3 --depth 1 https://github.com/cavi-ai/obsidian-agent.git && node obsidian-agent/scripts/install.mjs --host opencode --scope user --dry-run");
+  assert.equal(discoveryInstallCommand("hermes", "mlx-agent", undefined), "git clone https://github.com/cavi-ai/mlx-agent.git && python3 mlx-agent/scripts/mlx-agent install hermes --scope user --dry-run --json");
+  assert.deepEqual(claudeSource("mlx-agent", release), { source: "github", repo: "cavi-ai/mlx-agent", ref: "v1.2.3", sha: "b".repeat(40) });
+  assert.deepEqual(claudeSource("loop-killer", undefined), { source: "github", repo: "cavi-ai/loop-killer" });
+});
+
+test("rejects host projections and packages that drift from the release pin", async () => {
+  const root = await fixture({ catalog: canonical, claude: [{ name: "mlx-agent", source: { source: "github", repo: "cavi-ai/mlx-agent" }, description: "unpinned" }, entry("obsidian-agent", "claude")], codex: [entry("mlx-agent", "codex"), entry("obsidian-agent", "codex")], agy: [{ ...entry("mlx-agent", "agy"), install: { command: discoveryInstallCommand("agy", "mlx-agent", undefined) } }], opencode: [entry("mlx-agent", "opencode"), entry("obsidian-agent", "opencode")], openclaw: [entry("mlx-agent", "openclaw")], hermes: [entry("mlx-agent", "hermes")] });
+  const pinsPath = path.join(root, "releases.json");
+  const pins = JSON.parse(await readFile(pinsPath, "utf8"));
+  pins["obsidian-agent"].commit = "c".repeat(40);
+  await writeFile(pinsPath, JSON.stringify(pins));
+  const errors = await validateCatalog(root);
+  assert(errors.includes("claude source does not match its release pin: mlx-agent"), errors.join("\n"));
+  assert(errors.includes("agy install command mismatch: mlx-agent"), errors.join("\n"));
+  assert(errors.includes("codex package does not match its release pin: obsidian-agent"), errors.join("\n"));
+  assert(errors.includes("claude source does not match its release pin: obsidian-agent"), errors.join("\n"));
+});
+
+test("requires well-formed release pins for every plugin with a Codex package", async () => {
+  const cases = [
+    [(pins) => { delete pins["mlx-agent"]; }, "release pin missing: mlx-agent"],
+    [(pins) => { pins.ghost = { tag: "v1.0.0", commit: "a".repeat(40) }; }, "release pin for unknown plugin: ghost"],
+    [(pins) => { pins["mlx-agent"].tag = "1.0.0"; }, "release pin mlx-agent tag must be vX.Y.Z"],
+    [(pins) => { pins["mlx-agent"].commit = "abc1234"; }, "release pin mlx-agent commit must be a full lowercase commit"],
+    [(pins) => { pins["mlx-agent"].branch = "main"; }, "release pin mlx-agent must have only tag and commit"]
+  ];
+  for (const [mutate, expected] of cases) {
+    const root = await fixture({ catalog: canonical });
+    const pinsPath = path.join(root, "releases.json");
+    const pins = JSON.parse(await readFile(pinsPath, "utf8"));
+    mutate(pins);
+    await writeFile(pinsPath, JSON.stringify(pins));
+    const errors = await validateCatalog(root);
+    assert(errors.includes(expected), `missing ${expected}\n${errors.join("\n")}`);
+  }
 });
 
 test("accepts the canonical plugins and truthful host projections", async () => {
@@ -395,7 +449,10 @@ test("requires a closed and fully typed trusted-integrity registry", async () =>
     [(registry) => { registry["mlx-agent"].extra = true; }, "trusted integrity mlx-agent unexpected property: extra"],
     [(registry) => { delete registry["mlx-agent"].source_path; }, "trusted integrity mlx-agent source_path mismatch"],
     [(registry) => { registry["obsidian-agent"].tree = "A".repeat(64); }, "trusted integrity obsidian-agent tree must be 64 lowercase hexadecimal characters"],
-    [(registry) => { registry["obsidian-agent"].tree = "0".repeat(63); }, "trusted integrity obsidian-agent tree must be 64 lowercase hexadecimal characters"]
+    [(registry) => { registry["obsidian-agent"].tree = "0".repeat(63); }, "trusted integrity obsidian-agent tree must be 64 lowercase hexadecimal characters"],
+    [(registry) => { registry["mlx-agent"].source_commit = "main"; }, "trusted integrity mlx-agent source_commit must be a full lowercase commit"],
+    [(registry) => { registry["mlx-agent"].skills = ["mlx-wire", "mlx-adopt"]; }, "trusted integrity mlx-agent skills must be sorted unique skill names"],
+    [(registry) => { delete registry["obsidian-agent"].skills; }, "trusted integrity obsidian-agent skills must be sorted unique skill names"]
   ];
   for (const [mutateOrValue, expected] of cases) {
     const root = await fixture({ catalog: canonical });

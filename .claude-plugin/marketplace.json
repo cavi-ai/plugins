@@ -1,21 +1,39 @@
 {
   "name": "cavi-ai",
-  "owner": { "name": "Cavi AI", "url": "https://github.com/cavi-ai" },
-  "metadata": { "description": "Cavi AI plugins for agent hosts." },
+  "owner": {
+    "name": "Cavi AI",
+    "url": "https://github.com/cavi-ai"
+  },
+  "metadata": {
+    "description": "Cavi AI plugins for agent hosts."
+  },
   "plugins": [
     {
       "name": "mlx-agent",
-      "source": { "source": "github", "repo": "cavi-ai/mlx-agent" },
+      "source": {
+        "source": "github",
+        "repo": "cavi-ai/mlx-agent",
+        "ref": "v0.10.0",
+        "sha": "6e6effd57bc4fce90760d938a939aef1f18e1f49"
+      },
       "description": "Discover, verify, and wire local MLX-optimized models on Apple Silicon."
     },
     {
       "name": "obsidian-agent",
-      "source": { "source": "github", "repo": "cavi-ai/obsidian-agent" },
+      "source": {
+        "source": "github",
+        "repo": "cavi-ai/obsidian-agent",
+        "ref": "v0.1.0",
+        "sha": "b0b0cf03658b4f74c632db54834cb9add337c40a"
+      },
       "description": "Portable Obsidian vault workflows powered by the official Obsidian CLI."
     },
     {
       "name": "loop-killer",
-      "source": { "source": "github", "repo": "cavi-ai/loop-killer" },
+      "source": {
+        "source": "github",
+        "repo": "cavi-ai/loop-killer"
+      },
       "description": "Ends a stop-hook re-prompt loop: after repeated re-prompt turns with no tool work, it clears the active goal and says so."
     }
   ]
