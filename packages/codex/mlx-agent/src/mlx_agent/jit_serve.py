@@ -6,6 +6,7 @@ server process; a request lease lasts through the final streamed byte.
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import hmac
 import http.client
@@ -26,10 +27,14 @@ from pathlib import Path
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from mlx_agent import responses_api
+from mlx_agent.messages_api import (MessagesRequestError, StreamTranslator, WorkerResponseError, error_body,
+                                    from_chat_response, to_chat_request)
 from mlx_agent.transactions import _atomic_in_directory
 
 MAX_BODY = 16 * 1024 * 1024
 MAX_REQUESTS = 32
+STORED_RESPONSES = 64
 
 
 def validate_memory_policy(policy=None):
@@ -371,7 +376,20 @@ class GatewayServer(ThreadingHTTPServer):
         self.controller = ModelWorker(config)
         self.config = config
         self.slots = threading.BoundedSemaphore(MAX_REQUESTS + 4)
+        self.responses = collections.OrderedDict()
+        self.responses_lock = threading.Lock()
         super().__init__(address, GatewayHandler)
+
+    def remember(self, response):
+        """Keep the most recent stored Responses objects for this gateway process."""
+        with self.responses_lock:
+            self.responses[response["id"]] = response
+            while len(self.responses) > STORED_RESPONSES:
+                self.responses.popitem(last=False)
+
+    def recall(self, identifier):
+        with self.responses_lock:
+            return self.responses.get(identifier)
 
     def server_bind(self):
         # HTTPServer normally performs reverse DNS here. This gateway binds
@@ -449,7 +467,67 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def _error(self, error):
-        self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+        if self.path == "/v1/messages":
+            self._json(error.status, error_body(error.status, str(error)))
+        elif self.path.startswith("/v1/responses"):
+            self._json(error.status, responses_api.error_body(error.status, error.code, str(error)))
+        else:
+            self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+
+    @staticmethod
+    def _worker_failure(response):
+        detail = response.read(4096)
+        try:
+            reason = json.loads(detail).get("error")
+        except (ValueError, AttributeError):
+            reason = None
+        message = "Model worker returned HTTP {}".format(response.status)
+        return GatewayError(502, "worker_error", message + (": {}".format(reason) if isinstance(reason, str) else "."))
+
+    def _relay(self, response, translate):
+        """Answer a non-streamed request from the worker's translated chat completion."""
+        if response.status != 200:
+            raise self._worker_failure(response)
+        payload = response.read(MAX_BODY + 1)
+        try:
+            if len(payload) > MAX_BODY:
+                raise WorkerResponseError("Model worker response exceeds 16 MiB.")
+            value = translate(json.loads(payload))
+        except WorkerResponseError as error:
+            raise GatewayError(502, "invalid_worker_response", str(error))
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+            raise GatewayError(502, "invalid_worker_response", "Model worker returned an invalid response.")
+        self._json(200, value)
+        return value
+
+    def _stream(self, response, translator):
+        """Translate the worker's chat-completion chunks into client events as they arrive."""
+        if response.status != 200:
+            raise self._worker_failure(response)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        self.wfile.write(b"".join(translator.start()))
+        try:
+            while line := response.readline(MAX_BODY):
+                if not line.startswith(b"data: "):
+                    continue
+                data = line[len(b"data: "):].strip()
+                if data == b"[DONE]":
+                    self.wfile.write(b"".join(translator.finish()))
+                    break
+                self.wfile.write(b"".join(translator.chunk(json.loads(data))))
+                self.wfile.flush()
+            else:
+                raise WorkerResponseError("Model worker stream ended early.")
+        except WorkerResponseError as error:
+            self.wfile.write(b"".join(translator.fail(str(error))))
+        except (ValueError, TypeError, AttributeError):
+            self.wfile.write(b"".join(translator.fail("Model worker returned an invalid streamed response.")))
+        self.wfile.flush()
 
     def do_GET(self):
         try:
@@ -460,6 +538,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._json(200, {"status": "ok"})
             elif self.path == "/_mlx/status":
                 self._json(200, self.server.controller.status())
+            elif self.path.startswith("/v1/responses/"):
+                stored = self.server.recall(self.path[len("/v1/responses/"):])
+                if stored is None:
+                    raise GatewayError(404, "not_found", "No stored response has that id.")
+                self._json(200, stored)
             else:
                 raise GatewayError(404, "not_found", "Unknown endpoint.")
         except GatewayError as error:
@@ -491,7 +574,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if self.path == "/_mlx/policy":
                 self._json(200, self.server.controller.configure(body))
                 return
-            if self.path not in ("/v1/chat/completions", "/v1/completions"):
+            translated = self.path in ("/v1/messages", "/v1/responses")
+            if self.path == "/v1/messages":
+                try:
+                    body = to_chat_request(body)
+                except MessagesRequestError as error:
+                    raise GatewayError(400, "invalid_request", str(error))
+            elif self.path == "/v1/responses":
+                try:
+                    fields, body = responses_api.envelope(body), responses_api.to_chat_request(body)
+                except responses_api.ResponsesRequestError as error:
+                    raise GatewayError(400, "invalid_request", str(error))
+            elif self.path not in ("/v1/chat/completions", "/v1/completions"):
                 raise GatewayError(404, "not_found", "Unknown inference endpoint.")
             aliases = {self.server.config["model"], self.server.config["local_path"], "default_model"}
             local = Path(self.server.config["local_path"])
@@ -511,8 +605,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
             port = self.server.controller.acquire()
             leased = True
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
-            connection.request("POST", self.path, json.dumps(body), {"Content-Type": "application/json"})
+            connection.request("POST", "/v1/chat/completions" if translated else self.path, json.dumps(body),
+                               {"Content-Type": "application/json"})
             response = connection.getresponse()
+            if self.path == "/v1/messages" and body.get("stream"):
+                response_started = True
+                self._stream(response, StreamTranslator(requested))
+                return
+            if self.path == "/v1/messages":
+                self._relay(response, lambda value: from_chat_response(value, requested))
+                return
+            if self.path == "/v1/responses":
+                if body.get("stream"):
+                    response_started = True
+                    stream = responses_api.ResponseStream(requested, fields)
+                    self._stream(response, stream)
+                    result = stream.response
+                else:
+                    result = self._relay(response, lambda value: responses_api.from_chat_response(value, requested, fields))
+                if fields["store"]:
+                    self.server.remember(result)
+                return
             self.send_response(response.status)
             self.send_header("Content-Type", response.getheader("Content-Type", "application/json"))
             self.send_header("Connection", "close")
