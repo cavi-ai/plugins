@@ -65,7 +65,7 @@ jobs:
           node scripts/validate-catalog.mjs
           echo "RESOLVED=$resolved" >> "$GITHUB_ENV"
 
-      - name: Open a pull request
+      - name: Open and merge a pull request
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -73,7 +73,11 @@ jobs:
           set -euo pipefail
           if [ -z "$(git status --porcelain)" ]; then echo "The catalog already points $NAME at $TAG"; exit 0; fi
           branch="sync/$NAME-$TAG"
-          if git ls-remote --exit-code --heads origin "$branch" > /dev/null; then echo "Branch $branch already exists"; exit 1; fi
+          # The catalog gate above passed, so the sync merges as soon as it is proposed.
+          if git ls-remote --exit-code --heads origin "$branch" > /dev/null; then
+            gh pr merge "$branch" --squash --delete-branch
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
@@ -92,3 +96,4 @@ jobs:
             echo "- \`node --test\` and \`node scripts/validate-catalog.mjs\` passed in $RUN_URL."
           } > "$body"
           gh pr create --base main --head "$branch" --title "chore: sync $NAME $TAG" --body-file "$body"
+          gh pr merge "$branch" --squash --delete-branch

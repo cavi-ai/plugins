@@ -16,7 +16,7 @@ The machine-readable source of truth is [`catalog.json`](catalog.json). Claude a
 
 [`releases.json`](releases.json) pins each released plugin to one tag and commit, and every host installs that release: the Claude marketplace source carries the tag as `ref` and the commit as `sha`, each discovery install command clones the tag, and the Codex package is copied from it. `loop-killer` has no release yet, so its Claude source follows the default branch.
 
-A plugin's release workflow sends a `cavi-oss-release` dispatch. [Sync plugin release](.github/workflows/sync-plugin-release.yml) checks out the tag, confirms it resolves to the released commit, points every host at it with `scripts/sync-release.mjs`, runs the catalog gate and opens a pull request. The same workflow runs by hand from the Actions tab with a plugin name and tag. Locally:
+A plugin's release workflow sends a `cavi-oss-release` dispatch. [Sync plugin release](.github/workflows/sync-plugin-release.yml) checks out the tag, confirms it resolves to the released commit, points every host at it with `scripts/sync-release.mjs`, runs the catalog gate, opens a pull request and merges it. A sync branch left open is merged on the next run for that release. The same workflow runs by hand from the Actions tab with a plugin name and tag. Locally:
 
 ```sh
 node scripts/sync-release.mjs --name mlx-agent --source <checkout at the tag> --tag <release tag> --commit <full commit>
