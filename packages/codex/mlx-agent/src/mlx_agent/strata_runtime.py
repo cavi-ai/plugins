@@ -14,8 +14,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-ENGINE_REVISION = "ac0523f51c9935805904de889747d2b4ce011516"
-HTTP_REVISION = "a0116b2782a5b82622358c04a06496485d12b2d6"
+ENGINE_REVISION = "94817fd011fb90d49a66d68c802a8d80bfe2d859"
+HTTP_REVISION = "296b59d2f73c8f04a805df29c2fa97655adace78"
+_PREVIOUS_REVISIONS = ("ac0523f51c9935805904de889747d2b4ce011516", "a0116b2782a5b82622358c04a06496485d12b2d6")
 MODEL_MARKER = "strata-model.json"
 INSTALL_MARKER = "installed.json"
 _FIRST = re.compile(r"Qwen3\.8-Flash-Next-GSQ-RCO-(Q2_0|IQ3_S)-00001-of-00002\.gguf")
@@ -80,12 +81,15 @@ def installed_runtime(root=None):
         python = root / "engine/.venv/bin/python"
         engine = root / "strata-mlx"
         required = (root / "engine/strata_mlx/serve.py", root / "http/serve/server.py", root / "http/tools/strata_tokenizer.py")
-        if (marker.get("engine_revision") != ENGINE_REVISION or marker.get("http_revision") != HTTP_REVISION
+        if ((marker.get("engine_revision"), marker.get("http_revision")) not in
+                ((ENGINE_REVISION, HTTP_REVISION), _PREVIOUS_REVISIONS)
                 or not python.is_file() or not engine.is_file() or engine.is_symlink() or not os.access(engine, os.X_OK)
                 or engine.read_text() != engine_launcher(root) or not all(p.is_file() for p in required)
                 or marker.get("source_sha256") != source_digest(root)):
             raise ValueError("Missing, modified or incompatible Strata installation")
-        return {"root": str(root.absolute()), "python": str(python.absolute()), "engine": str(engine.absolute()), "fingerprint": marker["source_sha256"]}
+        return {"root": str(root.absolute()), "python": str(python.absolute()), "engine": str(engine.absolute()),
+                "fingerprint": marker["source_sha256"], "engine_revision": marker["engine_revision"],
+                "http_revision": marker["http_revision"]}
     except (OSError, ValueError, TypeError) as error:
         raise StrataError("strata_not_installed", str(error)) from error
 
@@ -175,15 +179,25 @@ def read_model(path):
         raise StrataError("strata_model_invalid", str(error)) from error
 
 
-def memory_estimate(model, expert_memory_gb=None, context_tokens=131072):
-    """Conservative resident estimate for the reviewed paging budget and context."""
+def _validate_context(context_tokens):
     if type(context_tokens) is not int or not 512 <= context_tokens <= 131072:
         raise StrataError("invalid_arguments", "Strata context must be an integer from 512 to 131072 tokens.")
+
+
+def memory_estimate(model, expert_memory_gb=None, context_tokens=131072, speculation=False):
+    """Conservative resident estimate for the reviewed paging budget and context."""
+    _validate_context(context_tokens)
     if expert_memory_gb is None:
-        return model["memory_estimate_bytes"] - 131072 * 30000 + context_tokens * 30000
+        unused_draft = 0 if speculation else model.get("mtp_bytes", 0)
+        return model["memory_estimate_bytes"] - unused_draft - 131072 * 30000 + context_tokens * 30000
     if (type(expert_memory_gb) not in (int, float) or not math.isfinite(expert_memory_gb)
             or not 0.5 <= expert_memory_gb <= 64):
         raise StrataError("invalid_arguments", "Expert memory must be a finite number from 0.5 to 64 GB.")
+    fixed, experts = _memory_parts(model, context_tokens, speculation)
+    return math.ceil(min(experts, expert_memory_gb * 1e9) + fixed)
+
+
+def _memory_parts(model, context_tokens, speculation):
     from mlx_agent.gguf import GGUFError, read_gguf_header
     try:
         header = read_gguf_header(model["gguf"], include_tensors=True)
@@ -203,22 +217,65 @@ def memory_estimate(model, expert_memory_gb=None, context_tokens=131072):
                     floats += count * 2
         if not experts or not dense:
             raise ValueError("Expert and dense tensor sizes are required")
-        mtp_bytes = model.get("mtp_bytes", 0)
+        mtp_bytes = model.get("mtp_bytes", 0) if speculation else 0
         # Count dense expansion, Q6_K prompt copies, full draft files, runtime
         # working memory and context cache. The n-gram companion remains on disk.
-        return math.ceil(min(experts, expert_memory_gb * 1e9) + dense * 2 + floats
-                         + mtp_bytes + 5e9 + context_tokens * 30000)
+        return math.ceil(dense * 2 + floats + mtp_bytes + 5e9 + context_tokens * 30000), experts
     except (GGUFError, OSError, ValueError, KeyError) as error:
         raise StrataError("strata_memory_unknown", "Cannot estimate paged Strata memory: " + str(error)) from error
 
 
-def frontend_config(model, runtime, speculation=False, expert_memory_gb=None, context_tokens=131072):
-    memory_estimate(model, expert_memory_gb, context_tokens)
+def memory_allocation(model, budget_gb, context_tokens=131072, speculation=False):
+    """Resolve an estimated total allowance without changing native expert selection."""
+    if type(budget_gb) not in (int, float) or not math.isfinite(budget_gb) or not 1 <= budget_gb <= 1024:
+        raise StrataError("invalid_arguments", "Model memory budget must be a finite value from 1 to 1024 GB.")
+    _validate_context(context_tokens)
+    fixed, experts = _memory_parts(model, context_tokens, speculation)
+    whole = fixed + experts
+    budget = math.floor(budget_gb * 1e9)
+    if whole <= budget:
+        cap, estimate, mode = None, whole, "resident"
+    else:
+        remaining = budget - fixed
+        if remaining < min(experts, 500_000_000):
+            raise StrataError("memory_budget_too_small", "Model memory budget cannot hold fixed weights, context and the minimum expert cache.")
+        # Round down before converting to native decimal GB; never overspend on rounding.
+        cap = max(.5, min(64, remaining // 1_000_000 / 1000))
+        estimate, mode = math.ceil(fixed + min(experts, cap * 1e9)), "paged"
+    return {"budget_bytes": budget, "estimated_resident_bytes": estimate,
+            "expert_memory_gb": cap, "mode": mode}
+
+
+def resolve_decoding(model, speculation=False, decoding=None):
+    if type(speculation) is not bool or (decoding is not None and decoding not in ("plain", "lookup", "mtp")):
+        raise StrataError("invalid_arguments", "Strata decoding must be plain, lookup or mtp.")
+    if decoding is not None and speculation:
+        raise StrataError("invalid_arguments", "Choose a decoding mode or legacy speculation, not both.")
+    if decoding == "mtp" and not model.get("mtp"):
+        raise StrataError("strata_draft_required", "MTP decoding requires prepared local draft-head assets.")
+    if decoding is not None:
+        return decoding
+    if speculation:
+        return "mtp" if model.get("mtp") else "lookup"
+    return "plain"
+
+
+def frontend_config(model, runtime, speculation=False, expert_memory_gb=None, context_tokens=131072,
+                    memory_budget_gb=None, decoding=None):
+    mode = resolve_decoding(model, speculation, decoding)
+    speculation = mode == "mtp"
+    if memory_budget_gb is not None:
+        if expert_memory_gb is not None:
+            raise StrataError("invalid_arguments", "Choose a total model memory budget or an expert budget.")
+        expert_memory_gb = memory_allocation(model, memory_budget_gb, context_tokens, speculation)["expert_memory_gb"]
+    else:
+        memory_estimate(model, expert_memory_gb, context_tokens, speculation)
     args = ["--native", model["gguf"], "--spec", "4" if speculation else "1",
-            "--suffix-draft", "auto" if speculation else "0", "--max-context", str(context_tokens)]
+            "--suffix-draft", "1" if mode == "lookup" else "0", "--max-context", str(context_tokens)]
     if expert_memory_gb is not None:
         args += ["--expert-memory", str(expert_memory_gb)]
-    if model["mtp"]:
+    args += ["--conversation-cache-mib", "0", "--keep-awake", "0", "--wired", "off"]
+    if speculation and model["mtp"]:
         args += ["--mtp", model["mtp"]]
     return {"exe": runtime["engine"], "args": args, "cwd": runtime["root"], "tokenizer": model["tokenizer"],
             "model_name": model["root"], "host": "127.0.0.1", "open_browser": False, "prevent_sleep": False,
@@ -234,7 +291,9 @@ def main():
     parser.add_argument("--host", choices=["127.0.0.1"], default="127.0.0.1")
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--speculation", choices=["on", "off"], default="off")
+    parser.add_argument("--decoding", choices=["plain", "lookup", "mtp"])
     parser.add_argument("--expert-memory-gb", type=float)
+    parser.add_argument("--memory-budget-gb", type=float)
     parser.add_argument("--context-tokens", type=int, default=131072)
     parser.add_argument("--expected-model-fingerprint", required=True)
     parser.add_argument("--expected-runtime-fingerprint", required=True)
@@ -245,7 +304,8 @@ def main():
         raise StrataError("preview_stale", "The model assets or Strata runtime changed after the serving preview.")
     os.environ.update(MLX_AGENT_STRATA_ROOT=runtime["root"], HF_HUB_OFFLINE="1", HF_DATASETS_OFFLINE="1", MLX_ENABLE_TF32="0")
     # The only config reaching the frontend is constructed here; model files cannot supply code or commands.
-    config = frontend_config(model, runtime, args.speculation == "on", args.expert_memory_gb, args.context_tokens)
+    config = frontend_config(model, runtime, args.speculation == "on" if args.decoding is None else False,
+                             args.expert_memory_gb, args.context_tokens, args.memory_budget_gb, args.decoding)
     source = Path(runtime["root"]) / "http"
     sys.path[:0] = [str(source), str(source / "tools")]
     with tempfile.TemporaryDirectory(prefix="mlx-agent-strata-") as directory:

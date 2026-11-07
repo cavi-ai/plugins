@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import secrets
@@ -230,11 +231,21 @@ def _require_decode_identity(plan):
                              "Review a fresh serving preview.")
 
 
+def _require_vision_identity(plan):
+    if "vision_profile" in plan:
+        from .vision_runtime import identity
+        configured = plan["vision_profile"]
+        facts = {key: value for key, value in configured.items() if key != "adapter_enabled"}
+        if facts != identity(configured["runtime_executable"]):
+            raise ServeError("vision_profile_changed", "Vision runtime source or dependencies changed.",
+                             "Review a fresh serving preview.")
+
+
 def plan_start(repo, runtime, recipes, port=None, max_tokens=MAX_TOKENS_DEFAULT,
                adapter_path=None, path=None, jit=False, receipts_dir=None, hf_cache=None, memory_policy=None,
-               runtime_executable=None, strata_speculation=False,
+               runtime_executable=None, strata_speculation=False, strata_decoding=None,
                strata_expert_memory_gb=None, strata_context_tokens=None, training_receipt=None, thinking="default",
-               m5_prefill=False, prompt_lookup=False):
+               m5_prefill=False, prompt_lookup=False, vision_cache=False):
     """Render the start plan and local file identities without side effects."""
     if thinking not in ("default", "off"):
         raise ServeError("invalid_arguments", "thinking must be default or off.", "Pass --thinking off or omit it.")
@@ -244,6 +255,9 @@ def plan_start(repo, runtime, recipes, port=None, max_tokens=MAX_TOKENS_DEFAULT,
     if type(prompt_lookup) is not bool or (prompt_lookup and runtime != "mlx_lm"):
         raise ServeError("invalid_arguments", "Code-edit acceleration requires MLX-LM.",
                          "Use --runtime auto or mlx_lm, or omit --prompt-lookup.")
+    if type(vision_cache) is not bool or (vision_cache and runtime != "mlx-vlm"):
+        raise ServeError("invalid_arguments", "Vision feature reuse requires MLX-VLM.",
+                         "Use --runtime auto or mlx-vlm, or omit --vision-cache.")
     binding = None
     if training_receipt is not None:
         if repo is not None or path is not None or adapter_path is not None:
@@ -266,6 +280,11 @@ def plan_start(repo, runtime, recipes, port=None, max_tokens=MAX_TOKENS_DEFAULT,
             raise ServeError("invalid_arguments", str(error), "Correct the memory policy.") from error
         if not jit:
             raise ServeError("jit_required", "Memory policy requires a JIT endpoint.", "Use --jit.")
+        if runtime != "strata" and "model_memory_budget_gb" in memory_policy:
+            raise ServeError("invalid_arguments", "Model memory budgets currently require Strata.", "Select a prepared Strata profile.")
+        if runtime == "strata" and "context_tokens" in memory_policy:
+            from .jit_serve import STRATA_CONTEXT
+            raise ServeError("invalid_arguments", STRATA_CONTEXT, "Remove --context-tokens.")
     has_repo = isinstance(repo, str) and bool(repo.strip())
     has_path = isinstance(path, str) and bool(path.strip())
     if has_repo == has_path:
@@ -332,18 +351,27 @@ def plan_start(repo, runtime, recipes, port=None, max_tokens=MAX_TOKENS_DEFAULT,
         "max_tokens": str(max_tokens),
         "runtime_adapter": str(Path(__file__).with_name("strata_runtime.py").resolve()),
     }
-    strata_model = strata_runtime = None
-    if runtime != "strata" and (strata_expert_memory_gb is not None or strata_context_tokens is not None):
+    strata_model = strata_runtime = strata_allocation = None
+    if runtime != "strata" and (strata_expert_memory_gb is not None or strata_context_tokens is not None or strata_decoding is not None):
         raise ServeError("invalid_arguments", "Strata memory controls require the Strata runtime.",
                          "Select a prepared local Strata profile.")
     if runtime == "strata":
-        from .strata_runtime import StrataError, installed_runtime, read_model, memory_estimate
+        from .strata_runtime import StrataError, installed_runtime, read_model, memory_estimate, memory_allocation, resolve_decoding
         try:
             if not has_path or adapter_path is not None or type(strata_speculation) is not bool:
                 raise StrataError("strata_model_required", "Strata requires a local GGUF profile without a LoRA adapter.")
             strata_model = read_model(local_path)
             strata_context_tokens = 131072 if strata_context_tokens is None else strata_context_tokens
-            strata_memory_bytes = memory_estimate(strata_model, strata_expert_memory_gb, strata_context_tokens)
+            strata_decoding = resolve_decoding(strata_model, strata_speculation, strata_decoding)
+            uses_draft = strata_decoding == "mtp"
+            budget = (memory_policy or {}).get("model_memory_budget_gb")
+            if budget is not None:
+                if strata_expert_memory_gb is not None:
+                    raise StrataError("invalid_arguments", "Choose a total model memory budget or an expert budget.")
+                strata_allocation = memory_allocation(strata_model, budget, strata_context_tokens, uses_draft)
+                strata_memory_bytes = strata_allocation["estimated_resident_bytes"]
+            else:
+                strata_memory_bytes = memory_estimate(strata_model, strata_expert_memory_gb, strata_context_tokens, uses_draft)
             strata_runtime = installed_runtime()
             if runtime_executable is not None and runtime_executable != strata_runtime["python"]:
                 raise StrataError("strata_not_installed", "The reviewed Strata executable changed.")
@@ -353,11 +381,14 @@ def plan_start(repo, runtime, recipes, port=None, max_tokens=MAX_TOKENS_DEFAULT,
     argv = [part.format(**values) for part in recipe["argv"]]
     if strata_model:
         argv += ["--runtime-root", strata_runtime["root"], "--speculation", "on" if strata_speculation else "off",
+                 "--decoding", strata_decoding,
                  "--context-tokens", str(strata_context_tokens),
                  "--expected-model-fingerprint", strata_model["fingerprint"],
                  "--expected-runtime-fingerprint", strata_runtime["fingerprint"]]
         if strata_expert_memory_gb is not None:
             argv += ["--expert-memory-gb", str(strata_expert_memory_gb)]
+        if strata_allocation is not None:
+            argv += ["--memory-budget-gb", str(budget)]
     if adapter_path is not None:
         argv.extend(
             part.format(adapter_path=str(adapter_path)) for part in recipe["adapter_argv"]
@@ -387,6 +418,16 @@ def plan_start(repo, runtime, recipes, port=None, max_tokens=MAX_TOKENS_DEFAULT,
             if prefill_kernel is not None and prefill_kernel["adapter_enabled"]:
                 argv += ["--m5-prefill-fingerprint", prefill_kernel["fingerprint"]]
             argv += native_argv[1:]
+    vision_profile = None
+    if vision_cache:
+        from .vision_runtime import available, identity
+        vision_profile = identity(values["executable"])
+        vision_profile["adapter_enabled"] = available(vision_profile)
+        if vision_profile["adapter_enabled"]:
+            argv = [vision_profile["runtime_python"], "-I", "-B",
+                    str(Path(__file__).with_name("vision_runtime.py").resolve()),
+                    "--runtime-executable", values["executable"],
+                    "--expected-vision-fingerprint", vision_profile["fingerprint"]] + native_argv[1:]
     plan = {
         "repo": repo.strip() if has_repo else None,
         "path": local_path,
@@ -402,15 +443,20 @@ def plan_start(repo, runtime, recipes, port=None, max_tokens=MAX_TOKENS_DEFAULT,
         plan.update(strata_model_fingerprint=strata_model["fingerprint"],
                     strata_runtime_fingerprint=strata_runtime["fingerprint"],
                     weight_format="gguf", weight_quantization=strata_model["quantization"], weights_preserved=True,
-                    strata_speculation=strata_speculation, strata_expert_memory_gb=strata_expert_memory_gb,
+                    strata_speculation=strata_speculation, strata_decoding=strata_decoding,
+                    strata_expert_memory_gb=strata_expert_memory_gb,
                     strata_context_tokens=strata_context_tokens, strata_memory_estimate_bytes=strata_memory_bytes,
                     readiness_deadline=900)
+        if strata_allocation is not None:
+            plan["strata_memory_allocation"] = strata_allocation
     elif has_path:
         plan.update(_local_weight_evidence(local_path))
     if prefill_kernel is not None:
         plan["prefill_kernel"] = prefill_kernel
     if decode_profile is not None:
         plan["decode_profile"] = decode_profile
+    if vision_profile is not None:
+        plan["vision_profile"] = vision_profile
     if adapter_path is not None:
         plan["adapter_identity"] = adapter_identity
     if thinking == "off":
@@ -520,6 +566,15 @@ def _pid_command(pid):
     return result.stdout.strip() or None
 
 
+def _pid_start(pid):
+    try:
+        result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "lstart="],
+                                capture_output=True, text=True, timeout=2, env=dict(os.environ, LC_ALL="C"))
+        return (result.stdout.strip() or None) if result.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _default_path_present(path):
     return Path(path).is_dir()
 
@@ -555,6 +610,7 @@ def start_serve(plan, receipts_dir=None, confirm=False, preview_hash=None,
     _require_adapter_identity(plan)
     _require_prefill_identity(plan)
     _require_decode_identity(plan)
+    _require_vision_identity(plan)
 
     if plan["runtime"] == "strata" and not plan.get("jit"):
         from .jit_serve import available_memory_bytes
@@ -621,12 +677,16 @@ def start_serve(plan, receipts_dir=None, confirm=False, preview_hash=None,
             )
 
     root.mkdir(parents=True, exist_ok=True)
+    if spawn is _default_spawn:
+        from .service_registry import register_receipts
+        register_receipts(root.absolute().parent.parent)
     log_path = root / "{0}.log".format(plan["port"])
     if plan.get("jit"):
         config_path = Path(plan["control_config"])
         if config_path.parent != root.absolute() or config_path.is_symlink():
             raise ServeError("invalid_arguments", "Unsafe JIT configuration path.", "Review a fresh serve plan.")
         config = {key: plan[key] for key in ("local_path", "fingerprint", "worker_argv", "max_tokens")}
+        config["runtime"] = plan["runtime"]
         if plan.get("adapter_path") is not None:
             config.update(adapter_path=plan["adapter_path"], adapter_identity=plan["adapter_identity"])
         if plan.get("training_binding") is not None:
@@ -634,9 +694,12 @@ def start_serve(plan, receipts_dir=None, confirm=False, preview_hash=None,
         if "readiness_deadline" in plan:
             config["worker_readiness_seconds"] = plan["readiness_deadline"]
         if plan["runtime"] == "strata":
-            config["runtime"] = "strata"
             config["strata_expert_memory_gb"] = plan.get("strata_expert_memory_gb")
             config["strata_context_tokens"] = plan.get("strata_context_tokens", 131072)
+            config["strata_speculation"] = plan.get("strata_speculation", False)
+            config["strata_decoding"] = plan["strata_decoding"]
+            if "strata_memory_allocation" in plan:
+                config["strata_memory_allocation"] = plan["strata_memory_allocation"]
         config.update(model=plan["repo"] or plan["path"], control_token=secrets.token_hex(32),
                       memory_policy=plan.get("memory_policy"), config_path=str(config_path),
                       state_path=str(root.absolute() / "{}.jit-state.json".format(plan["port"])),
@@ -655,6 +718,7 @@ def start_serve(plan, receipts_dir=None, confirm=False, preview_hash=None,
         _require_adapter_identity(plan)
         _require_prefill_identity(plan)
         _require_decode_identity(plan)
+        _require_vision_identity(plan)
     except ServeError:
         _terminate_pid(pid)
         raise
@@ -683,6 +747,12 @@ def start_serve(plan, receipts_dir=None, confirm=False, preview_hash=None,
         receipt["prefill_kernel"] = plan["prefill_kernel"]
     if "decode_profile" in plan:
         receipt["decode_profile"] = plan["decode_profile"]
+    if "vision_profile" in plan:
+        receipt["vision_profile"] = plan["vision_profile"]
+    if "strata_decoding" in plan:
+        receipt["strata_decoding"] = plan["strata_decoding"]
+    if "strata_memory_allocation" in plan:
+        receipt["strata_memory_allocation"] = plan["strata_memory_allocation"]
     content = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     _atomic_in_directory(root, receipt_path.name, content, 0o600)
     return {"status": "started", "receipt": receipt}
@@ -690,7 +760,15 @@ def start_serve(plan, receipts_dir=None, confirm=False, preview_hash=None,
 
 def _read_receipt(path):
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as source:
+            metadata = os.fstat(source.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+                return None
+            raw = source.read(1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024:
+                return None
+            value = json.loads(raw)
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     if not isinstance(value, dict) or value.get("kind") != SERVE_RECEIPT_KIND:
@@ -699,16 +777,24 @@ def _read_receipt(path):
         return None
     if not isinstance(value.get("argv"), list) or not isinstance(value.get("port"), int):
         return None
+    if (not value["argv"] or any(not isinstance(item, str) for item in value["argv"])
+            or not isinstance(value.get("runtime"), str) or "repo" not in value
+            or not (value.get("repo") or value.get("path"))):
+        return None
     return value
 
 
-def status_serve(receipts_dir=None, pid_alive=_pid_alive, pid_command=_pid_command):
+def status_serve(receipts_dir=None, pid_alive=_pid_alive, pid_command=_pid_command, deadline=None, errors=None):
     """Cross-check serve receipts against live processes; read-only."""
     root = receipts_root(receipts_dir)
     entries = []
     if not root.is_dir():
         return entries
     for path in sorted(root.glob("*.json")):
+        if deadline is not None and time.monotonic() >= deadline:
+            if errors is not None:
+                errors.append({"source": str(root.absolute().parent.parent), "message": "Service status deadline reached"})
+            break
         if len(entries) >= MAX_RECEIPTS:
             break
         receipt = _read_receipt(path)
@@ -727,6 +813,7 @@ def status_serve(receipts_dir=None, pid_alive=_pid_alive, pid_command=_pid_comma
             "argv_match": _argv_matches(receipt, command) if alive else False,
             "log_path": receipt.get("log_path"),
             "started_at": receipt.get("started_at"),
+            "process_started_at": _pid_start(receipt["pid"]) if alive and pid_command is _pid_command else None,
         })
         entries[-1].update(_adapter_metadata(receipt, root))
         if receipt.get("training_binding") is not None:
@@ -735,11 +822,16 @@ def status_serve(receipts_dir=None, pid_alive=_pid_alive, pid_command=_pid_comma
             entries[-1]["prefill_kernel"] = receipt["prefill_kernel"]
         if "decode_profile" in receipt:
             entries[-1]["decode_profile"] = receipt["decode_profile"]
+        if "vision_profile" in receipt:
+            entries[-1]["vision_profile"] = receipt["vision_profile"]
         if receipt.get("jit"):
             entries[-1]["jit"] = True
             if alive and entries[-1]["argv_match"]:
                 try:
-                    entries[-1].update(_jit_control(receipt, root, "status"))
+                    if deadline is None:
+                        entries[-1].update(_jit_control(receipt, root, "status"))
+                    else:
+                        entries[-1].update(_jit_control(receipt, root, "status", timeout=max(0.1, min(2, deadline - time.monotonic()))))
                 except ServeError:
                     entries[-1]["model_state"] = "unknown"
             else:
@@ -815,14 +907,14 @@ def _jit_config(receipt, root):
                          "Stop and review a fresh endpoint.") from error
 
 
-def _jit_control(receipt, root, action, policy=None):
+def _jit_control(receipt, root, action, policy=None, timeout=None):
     config = _jit_config(receipt, root)
     request = urllib.request.Request("http://127.0.0.1:{}/_mlx/{}".format(receipt["port"], action),
         data=json.dumps(policy or {}).encode() if action in ("unload", "policy") else None,
         headers={"Authorization": "Bearer " + config["control_token"], "Content-Type": "application/json"})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(request, timeout=10 if action == "unload" else 2) as response:
+        with opener.open(request, timeout=timeout if timeout is not None else (10 if action == "unload" else 2)) as response:
             state = json.load(response)
             if not isinstance(state, dict) or state.get("model_state") not in ("loaded", "unloaded", "loading", "unloading", "failed"):
                 raise ValueError("Invalid model residency status.")
@@ -859,20 +951,25 @@ def _owned_jit_worker(receipt, root):
     return None
 
 
-def unload_serve(port, receipts_dir=None, expected_pid=None):
-    return _configure_owned_jit(port, receipts_dir, expected_pid, "unload")
+def unload_serve(port, receipts_dir=None, expected_pid=None, expected_start=None):
+    return _configure_owned_jit(port, receipts_dir, expected_pid, "unload", expected_start=expected_start)
 
 
-def configure_serve_memory(port, policy, receipts_dir=None, expected_pid=None):
+def configure_serve_memory(port, policy, receipts_dir=None, expected_pid=None, expected_start=None):
     from .jit_serve import validate_memory_policy
+    clear_budget = isinstance(policy, dict) and "model_memory_budget_gb" in policy and policy["model_memory_budget_gb"] is None
     try:
         policy = validate_memory_policy(policy)
     except ValueError as error:
         raise ServeError("invalid_arguments", str(error), "Correct the memory policy.") from error
-    return _configure_owned_jit(port, receipts_dir, expected_pid, "policy", policy)
+    if clear_budget:
+        policy["model_memory_budget_gb"] = None
+    # The gateway merges changes; replacements must also clear omitted options.
+    return _configure_owned_jit(port, receipts_dir, expected_pid, "policy",
+                                dict({"context_tokens": None, "unload_under_pressure": False}, **policy), expected_start=expected_start)
 
 
-def _configure_owned_jit(port, receipts_dir, expected_pid, action, policy=None):
+def _configure_owned_jit(port, receipts_dir, expected_pid, action, policy=None, expected_start=None):
     root = receipts_root(receipts_dir)
     receipt = _read_receipt(root / "{}.json".format(port))
     if not receipt or not receipt.get("jit"):
@@ -880,6 +977,8 @@ def _configure_owned_jit(port, receipts_dir, expected_pid, action, policy=None):
                          "Enable Load on request for this endpoint first.")
     if expected_pid is not None and receipt["pid"] != expected_pid:
         raise ServeError("pid_argv_mismatch", "Endpoint identity changed.", "Refresh serving status before unloading.")
+    if expected_start is not None and _pid_start(receipt["pid"]) != expected_start:
+        raise ServeError("server_changed", "Endpoint process start changed.", "Refresh serving status before changing this service.")
     if not _pid_alive(receipt["pid"]) or not _argv_matches(receipt, _pid_command(receipt["pid"])):
         raise ServeError("pid_argv_mismatch", "Endpoint process no longer matches its receipt.",
                          "Refresh serving status before unloading.")
@@ -888,7 +987,7 @@ def _configure_owned_jit(port, receipts_dir, expected_pid, action, policy=None):
 
 
 def stop_serve(port, receipts_dir=None, pid_alive=_pid_alive, pid_command=_pid_command,
-               terminate=_terminate_pid, clock=time.monotonic, sleep=time.sleep):
+               terminate=_terminate_pid, clock=time.monotonic, sleep=time.sleep, expected_pid=None, expected_start=None):
     """Stop exactly the process a serve receipt owns; never kills by port scan."""
     root = receipts_root(receipts_dir)
     receipt_path = root / "{0}.json".format(port)
@@ -900,6 +999,9 @@ def stop_serve(port, receipts_dir=None, pid_alive=_pid_alive, pid_command=_pid_c
             "serve stop only stops processes that serve started; stop foreign processes yourself.",
         )
     pid = receipt["pid"]
+    if (expected_pid is not None and pid != expected_pid) or (expected_start is not None and _pid_start(pid) != expected_start):
+        raise ServeError("server_changed", "The selected serving process changed; nothing was stopped.",
+                         "Refresh serving status and review the current service.")
     orphan = _owned_jit_worker(receipt, root) if not pid_alive(pid) else None
     if orphan:
         pid = orphan

@@ -20,9 +20,11 @@ MANIFEST_SCHEMA = "backend/1"
 INSTALL_MARKER = ".mlx-agent-backend.json"
 PORT_MARKER = ".mlx-agent-port.json"
 CATEGORIES = ("text_llm", "vision_language", "speech_to_text", "text_to_speech", "classification", "image_generation",
-              "video_generation", "music_generation")
+              "video_generation", "music_generation", "mesh_generation")
 MAX_PROBE_FILES = 4000
 MAX_PROBE_FILE_BYTES = 1024 * 1024
+QUANTIZED_BITS = (4, 5, 6, 8)
+UNQUANTIZED_BITS = 32  # full-precision weights; only ports that declare it in port_bits accept it
 TYPE_PREFERENCE = {
     "speech_to_text": ("mlx-audio",),
     "text_to_speech": ("mlx-audio",),
@@ -32,6 +34,7 @@ TYPE_PREFERENCE = {
     "classification": ("mlx-embeddings",),
     "image_generation": ("mflux",),
     "video_generation": ("mlx-video",),
+    "mesh_generation": ("mlx-3d",),
 }
 DEFAULT_PREFERENCE = ("mlx-lm", "mlx-vlm", "mlx-audio")
 _ID = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
@@ -40,6 +43,8 @@ _PORT_FILE = re.compile(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*")
 _PIPELINE = re.compile(r"[A-Z][A-Za-z0-9]{0,95}")
 _REPO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_DOWNLOAD_URL = re.compile(r"https://[a-z0-9.-]+\.[a-z]{2,}(/[A-Za-z0-9_.-]+)*/[A-Za-z0-9_-][A-Za-z0-9_.-]*")
 _STRIP_SUFFIXES = ("_encoder", "_decoder", "_text", "_vision", "_audio", "_model")
 _VISION_FILE = re.compile(r"(vision|visual|image|siglip|clip)", re.IGNORECASE)
 _ENV_ALLOWLIST = (
@@ -121,10 +126,11 @@ def _validate_manifest(value, path):
             raise _invalid(path, "port_quantize group_size must be 32, 64, or 128")
     bits = value.get("port_bits", {})
     if not isinstance(bits, dict) or not set(bits) <= ported or not all(
-        isinstance(widths, list) and widths and all(width in (4, 8) and not isinstance(width, bool) for width in widths)
-        for widths in bits.values()
+        _valid_widths(widths, QUANTIZED_BITS + (UNQUANTIZED_BITS,)) for widths in bits.values()
     ):
-        raise _invalid(path, "port_bits map declared ports to the bit widths (4, 8) their conversions keep accurate")
+        raise _invalid(path, "port_bits map declared ports to the bit widths (4, 5, 6, 8, or 32 for unquantized) their conversions keep accurate")
+    if "q_bits" in value and not _valid_widths(value["q_bits"], QUANTIZED_BITS):
+        raise _invalid(path, "q_bits lists the bit widths (4, 5, 6 or 8) the backend's converter accepts")
     converters = value.get("port_convert", {})
     if not isinstance(converters, dict) or not set(converters) <= ported or not all(
         isinstance(module, str) and _PORT.fullmatch(module) for module in converters.values()
@@ -146,6 +152,42 @@ def _validate_manifest(value, path):
         for files in signatures.values()
     ):
         raise _invalid(path, "port_signatures map declared ports to the relative files that identify them")
+    requires = value.get("port_requires", {})
+    if not isinstance(requires, dict) or not set(requires) <= ported or not all(
+        isinstance(sources, dict) and sources and all(_valid_requirement(repo, files) for repo, files in sources.items())
+        for sources in requires.values()
+    ):
+        raise _invalid(path, "port_requires map declared ports to other repositories and the files their converter reads there")
+    downloads = value.get("port_downloads", {})
+    if not isinstance(downloads, dict) or not set(downloads) <= ported or not all(
+        isinstance(entries, list) and entries and all(_valid_download(entry) for entry in entries)
+        and len({download_name(entry) for entry in entries}) == len(entries)
+        for entries in downloads.values()
+    ):
+        raise _invalid(path, "port_downloads map declared ports to the https files (url, sha256, size) their converter reads")
+
+
+def _valid_download(entry):
+    return isinstance(entry, dict) and set(entry) == {"url", "sha256", "size"} and isinstance(entry["url"], str) \
+        and bool(_DOWNLOAD_URL.fullmatch(entry["url"])) and isinstance(entry["sha256"], str) \
+        and bool(_SHA256.fullmatch(entry["sha256"])) and type(entry["size"]) is int and entry["size"] > 0
+
+
+def download_name(entry):
+    """The file name a port download is stored and passed to its converter under: the URL's last segment."""
+    return entry["url"].rsplit("/", 1)[-1]
+
+
+def _valid_requirement(repo, files):
+    return isinstance(repo, str) and bool(_REPO_ID.fullmatch(repo)) and isinstance(files, list) and bool(files) and all(
+        isinstance(name, str) and _PORT_FILE.fullmatch(name) and ".." not in name.split("/") for name in files
+    )
+
+
+def _valid_widths(widths, allowed):
+    return isinstance(widths, list) and bool(widths) and all(
+        isinstance(width, int) and not isinstance(width, bool) and width in allowed for width in widths
+    ) and len(set(widths)) == len(widths)
 
 
 def _valid_recipe(repo, recipe, ported):
@@ -217,6 +259,15 @@ def port_bits(model_type, backend_id, manifests):
     return sorted(widths) if widths else None
 
 
+def conversion_bits(model_type, backend_id, manifests):
+    """The bit widths a conversion offers: the port's, else the backend converter's, else every quantized width."""
+    widths = port_bits(model_type, backend_id, manifests)
+    if widths:
+        return widths
+    declared = (manifests.get(backend_id) or {}).get("q_bits")
+    return sorted(declared) if declared else list(QUANTIZED_BITS)
+
+
 def port_files(model_type, backend_id, manifests):
     """The files that identify a port's checkpoints (its signature), or None."""
     manifest = manifests.get(backend_id) or {}
@@ -230,6 +281,33 @@ def snapshot_files(model_type, manifests):
         if files:
             return files
     return None
+
+
+def port_requirements(model_type, manifests):
+    """The files a ported type's converter reads from other repositories, by repository; empty when none."""
+    for backend_id in sorted(manifests):
+        found = (manifests[backend_id].get("port_requires") or {}).get(normalize_type(model_type or ""))
+        if found:
+            return found
+    return {}
+
+
+def port_downloads(model_type, manifests):
+    """The files a ported type's converter reads from outside Hugging Face (url, sha256, size); empty when none."""
+    for backend_id in sorted(manifests):
+        found = (manifests[backend_id].get("port_downloads") or {}).get(normalize_type(model_type or ""))
+        if found:
+            return found
+    return []
+
+
+def downloads_root(env=None):
+    """Where ``intake fetch`` keeps port downloads, each under its sha256."""
+    return backends_root(env).parent / "downloads"
+
+
+def download_path(entry, root=None):
+    return Path(root if root is not None else downloads_root()) / entry["sha256"] / download_name(entry)
 
 
 def port_for_files(names, manifests):

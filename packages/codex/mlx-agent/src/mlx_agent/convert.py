@@ -10,18 +10,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .backends import (
+    QUANTIZED_BITS,
+    UNQUANTIZED_BITS,
     BackendError,
     backend_environment,
     backend_python,
+    conversion_bits,
+    download_name,
+    download_path,
     load_manifests,
     port_bits,
     port_converter,
+    port_downloads,
+    port_requirements,
     recipe_for,
     read_install_marker,
     spawn_with_env,
     sync_ports,
 )
-from .gguf import GGUFError, describe_gguf, find_projector
+from .gguf import GGUF_PORT_BITS, GGUFError, describe_gguf, find_projector
 from .intake_source import validate_subfolder
 from .serve import (
     _argv_matches,
@@ -35,7 +42,9 @@ from .wiring import _MODEL
 
 CONVERT_RECEIPT_SCHEMA_VERSION = "1.0"
 CONVERT_RECEIPT_KIND = "convert"
-Q_BITS_CHOICES = (4, 8)
+Q_BITS_CHOICES = QUANTIZED_BITS
+# The music requantizer reloads an exported MLX checkpoint, checked at these widths only.
+MUSIC_REQUANTIZE_BITS = (4, 8)
 EXECUTABLE = "mlx_lm.convert"
 GGUF_RUNNER = Path(__file__).resolve().with_name("gguf_runner.py")
 MUSIC_REQUANTIZE_RUNNER = Path(__file__).resolve().with_name("music_requantize_runner.py")
@@ -95,7 +104,7 @@ def cached_subfolder(repo, subfolder, hf_cache=None):
 
 
 def plan_convert(repo, q_bits=4, out=None, backend=None, manifests=None, backends_root_dir=None, model_type=None,
-                 subfolder=None, hf_cache=None, source_path=None):
+                 subfolder=None, hf_cache=None, source_path=None, downloads_dir=None):
     """Render the exact conversion plan; side-effect free (a subfolder is looked up in the cache).
 
     ``model_type`` (from intake) selects a port's own converter when the port
@@ -114,7 +123,7 @@ def plan_convert(repo, q_bits=4, out=None, backend=None, manifests=None, backend
             "invalid_arguments", "model_type must be a config model_type such as qwen2 or laya.",
             "Pass --model-type exactly as intake resolve reports it.",
         )
-    _validate_q_bits(q_bits)
+    _validate_q_bits(q_bits, (UNQUANTIZED_BITS,))
     if subfolder is not None:
         try:
             validate_subfolder(subfolder)
@@ -136,7 +145,9 @@ def plan_convert(repo, q_bits=4, out=None, backend=None, manifests=None, backend
                 "Download it first: mlx-agent intake fetch {0}/{1}.".format(repo, subfolder),
             )
         hf_path = str(folder)
-    flags = ["--hf-path", hf_path, "--mlx-path", str(out), "--quantize", "--q-bits", str(q_bits)]
+    flags = ["--hf-path", hf_path, "--mlx-path", str(out)]
+    if q_bits != UNQUANTIZED_BITS:
+        flags += ["--quantize", "--q-bits", str(q_bits)]
     plan = {
         "repo": repo,
         "source": dict({"kind": "hf-cache", "repo": repo}, **({"subfolder": subfolder} if subfolder else {})),
@@ -156,6 +167,8 @@ def plan_convert(repo, q_bits=4, out=None, backend=None, manifests=None, backend
                 entries.append([str(item.relative_to(source)), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, content])
         plan["source"]["path"] = str(source)
         plan["source"]["fingerprint"] = hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode()).hexdigest()
+    if q_bits == UNQUANTIZED_BITS and backend in (None, "mlx-lm"):
+        raise ConvertError("invalid_arguments", "This conversion has no unquantized recipe.", _bits_hint(Q_BITS_CHOICES))
     if backend in (None, "mlx-lm"):
         plan["argv"] = [EXECUTABLE] + flags
         return _finalize_plan(plan)
@@ -170,12 +183,21 @@ def plan_convert(repo, q_bits=4, out=None, backend=None, manifests=None, backend
             "No optional backend named {0}.".format(backend),
             "Run mlx-agent backend list to see the declared backends.",
         )
-    widths = port_bits(model_type, backend, manifests)
-    if widths and q_bits not in widths:
+    widths = conversion_bits(model_type, backend, manifests)
+    if q_bits == UNQUANTIZED_BITS and q_bits not in widths:
+        raise ConvertError("invalid_arguments", "This conversion has no unquantized recipe.", _bits_hint(widths))
+    if q_bits not in widths:
+        owner = "{0} port".format(model_type) if port_bits(model_type, backend, manifests) else "{0} converter".format(backend)
         raise ConvertError(
             "invalid_arguments",
-            "The {0} port converts at {1} bits only.".format(model_type, " or ".join(str(width) for width in widths)),
-            "Pass --q-bits {0}.".format(widths[-1]),
+            "The {0} converts at {1} bits only.".format(owner, _joined(widths)),
+            _bits_hint(widths),
+        )
+    if backend == "mlx-audio" and _is_quantized_music_source(hf_path) and q_bits not in MUSIC_REQUANTIZE_BITS:
+        raise ConvertError(
+            "invalid_arguments",
+            "Exported music checkpoints requantize at {0} bits only.".format(_joined(MUSIC_REQUANTIZE_BITS)),
+            _bits_hint(MUSIC_REQUANTIZE_BITS),
         )
     python = backend_python(manifest, backends_root_dir)
     plan["backend"] = backend
@@ -185,6 +207,16 @@ def plan_convert(repo, q_bits=4, out=None, backend=None, manifests=None, backend
     if recipe and recipe["backend"] == backend and recipe["port"] == model_type:
         flags = _recipe_flags(recipe, flags, hf_cache)
         plan["recipe"] = {key: recipe[key] for key in ("base", "base_revision", "lora", "lora_scale")}
+    requires = _required_sources(repo, model_type, manifests, hf_cache) if converter else {}
+    for name, path in requires.items():
+        flags += ["--requires", "{0}={1}".format(name, path)]
+    if requires:
+        plan["requires"] = requires
+    downloads = _required_downloads(repo, model_type, manifests, downloads_dir) if converter else {}
+    for name, path in downloads.items():
+        flags += ["--download", "{0}={1}".format(name, path)]
+    if downloads:
+        plan["downloads"] = downloads
     if backend == "mlx-audio" and _is_quantized_music_source(hf_path):
         plan["argv"] = [str(python), str(MUSIC_REQUANTIZE_RUNNER)] + flags
     else:
@@ -205,6 +237,37 @@ def _is_quantized_music_source(path):
         return False
     return (isinstance(config, dict) and config.get("model_type") == "minimax_music3"
             and isinstance(config.get("quantization"), dict) and bool(config["quantization"]))
+
+
+def _required_sources(repo, model_type, manifests, hf_cache):
+    """Cached snapshots of the other repositories a port's converter reads, each holding the files it needs."""
+    found = {}
+    for name, files in sorted(port_requirements(model_type, manifests).items()):
+        snapshot = cached_snapshot(name, hf_cache)
+        missing = [item for item in files if snapshot is None or not (snapshot / item).is_file()]
+        if missing:
+            raise ConvertError(
+                "requirement_not_cached",
+                "{0} also needs {1} from {2} in the Hugging Face cache.".format(model_type, ", ".join(missing), name),
+                "Download it first: mlx-agent intake fetch {0} --model-type {1}.".format(repo, model_type),
+            )
+        found[name] = str(snapshot)
+    return found
+
+
+def _required_downloads(repo, model_type, manifests, downloads_dir):
+    """The files a port's converter reads from outside Hugging Face, each where ``intake fetch`` stored it."""
+    found = {}
+    for entry in port_downloads(model_type, manifests):
+        path = download_path(entry, downloads_dir)
+        if not path.is_file() or path.stat().st_size != entry["size"]:
+            raise ConvertError(
+                "requirement_not_cached",
+                "{0} also needs {1} from {2}.".format(model_type, download_name(entry), entry["url"].split("/")[2]),
+                "Download it first: mlx-agent intake fetch {0} --model-type {1}.".format(repo, model_type),
+            )
+        found[download_name(entry)] = str(path)
+    return found
 
 
 def _recipe_flags(recipe, flags, hf_cache):
@@ -230,17 +293,23 @@ def _finalize_plan(plan):
     return plan
 
 
-def _validate_q_bits(q_bits):
+def _joined(widths):
+    widths = [str(width) for width in widths]
+    return widths[0] if len(widths) == 1 else "{0} or {1}".format(", ".join(widths[:-1]), widths[-1])
+
+
+def _bits_hint(widths):
+    return "Pass --q-bits {0}.".format(_joined(widths))
+
+
+def _validate_q_bits(q_bits, extra=()):
     if not isinstance(q_bits, int) or isinstance(q_bits, bool):
-        raise ConvertError(
-            "invalid_arguments", "q_bits must be an integer.",
-            "Pass --q-bits 4 or --q-bits 8.",
-        )
-    if q_bits not in Q_BITS_CHOICES:
+        raise ConvertError("invalid_arguments", "q_bits must be an integer.", _bits_hint(Q_BITS_CHOICES))
+    if q_bits not in Q_BITS_CHOICES + tuple(extra):
         raise ConvertError(
             "invalid_arguments",
-            "q_bits must be one of {0}.".format(list(Q_BITS_CHOICES)),
-            "Only bounded 4bit and 8bit recipes are supported in v1.",
+            "q_bits must be one of {0}.".format(list(Q_BITS_CHOICES + tuple(extra))),
+            _bits_hint(Q_BITS_CHOICES),
         )
 
 
@@ -324,6 +393,12 @@ def plan_gguf_convert(gguf_path, q_bits=4, out=None, runner=None, describe=descr
     if draft is not None:
         plan["draft"] = dict(draft)
     port = draft["port"] if draft is not None else entry.get("port")
+    if port is not None and q_bits not in GGUF_PORT_BITS:
+        raise ConvertError(
+            "invalid_arguments",
+            "The {0} port converts GGUF files at {1} bits only.".format(port, _joined(GGUF_PORT_BITS)),
+            _bits_hint(GGUF_PORT_BITS),
+        )
     if port is not None:
         plan["port_converter"] = port
         plan["argv"].extend(["--port", port])

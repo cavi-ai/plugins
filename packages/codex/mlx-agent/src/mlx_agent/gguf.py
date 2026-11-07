@@ -14,6 +14,8 @@ import re
 import struct
 from pathlib import Path
 
+from .backends import QUANTIZED_BITS
+
 
 MAX_SCAN_FILES = 4000
 MAX_METADATA_PAIRS = 512
@@ -51,6 +53,9 @@ _DRAFT_PORTS = (("deepseek_v4_dspark", "dflash", "dflash.hyper_connection.count"
 ARCHITECTURE_PORTS = {"qwen35": "qwen35"}
 # The llama.cpp vision projector type each port attaches from the model's folder.
 PORT_PROJECTORS = {"qwen35": "qwen3vl_merger"}
+# Ports converted from GGUF quantize through their own tensor maps, checked at these widths only;
+# other GGUFs convert at every quantized width.
+GGUF_PORT_BITS = (4, 8)
 _MIN_NAME_MATCH = 6
 # Trailing MLX quantization labels in folder names: Foo-MLX-4bit, Foo-4.4bpw, Foo-bf16, Foo-mxfp8.
 _MLX_QUANT_SUFFIX = re.compile(
@@ -357,6 +362,17 @@ def _draft(metadata, architecture, tensor_count):
     }
 
 
+def conversion_bits(entry):
+    """The bit widths a GGUF entry converts at; none for companions and drafters no port converts."""
+    draft = entry.get("draft")
+    port = draft.get("port") if draft is not None else entry.get("port")
+    if port is not None:
+        return list(GGUF_PORT_BITS)
+    if draft is not None or entry.get("companion") or not entry.get("readable"):
+        return []
+    return list(QUANTIZED_BITS)
+
+
 def describe_gguf(path, signature=True):
     """Build one inventory entry for a GGUF file. Never raises for bad headers."""
     location = Path(path)
@@ -388,6 +404,7 @@ def describe_gguf(path, signature=True):
         "companion": any(token in stem.lower() for token in _COMPANION_NAMES),
         "draft": None,
         "port": None,
+        "q_bits": [],
         "readable": True,
         "error": None,
     }
@@ -418,6 +435,7 @@ def describe_gguf(path, signature=True):
         entry["model_key"] += "-draft"
     elif not entry["companion"]:
         entry["port"] = ARCHITECTURE_PORTS.get(str(entry["architecture"]).lower())
+    entry["q_bits"] = conversion_bits(entry)
     if signature:
         try:
             entry["signature"] = file_signature(location)
@@ -458,13 +476,31 @@ def find_projector(path, port):
     return {"path": str(matches[0]), "name": matches[0].name, "bytes": matches[0].stat().st_size}
 
 
-def _iter_files(roots, suffix, limit=MAX_SCAN_FILES):
+def _scan_error(error, errors):
+    if errors is not None:
+        item = {"path": str(error.filename or ""), "message": str(error)}
+        if item not in errors:
+            errors.append(item)
+
+
+def _readable_root(base, errors):
+    try:
+        with os.scandir(base):
+            pass
+        return True
+    except OSError as error:
+        _scan_error(error, errors)
+        return False
+
+
+def _iter_files(roots, suffix, limit=MAX_SCAN_FILES, errors=None):
     seen = set()
     for root in roots:
         base = Path(root).expanduser()
-        if not base.is_dir():
+        if not _readable_root(base, errors):
             continue
-        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        boundary = base.resolve()
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False, onerror=lambda error: _scan_error(error, errors)):
             if suffix == ".gguf" and "strata-model.json" in filenames:
                 from .strata_runtime import StrataError, read_model
                 try:
@@ -484,6 +520,8 @@ def _iter_files(roots, suffix, limit=MAX_SCAN_FILES):
                 location = Path(dirpath) / filename
                 try:
                     resolved = location.resolve()
+                    if not resolved.is_relative_to(boundary):
+                        continue
                 except OSError:
                     continue
                 if resolved in seen:
@@ -494,10 +532,10 @@ def _iter_files(roots, suffix, limit=MAX_SCAN_FILES):
                     return
 
 
-def scan_gguf(roots, signature=True, limit=MAX_SCAN_FILES):
+def scan_gguf(roots, signature=True, limit=MAX_SCAN_FILES, errors=None):
     """Inventory every GGUF file beneath the configured roots."""
     entries = []
-    for location in _iter_files(roots, GGUF_SUFFIX, limit):
+    for location in _iter_files(roots, GGUF_SUFFIX, limit, errors=errors):
         try:
             entries.append(describe_gguf(location, signature=signature))
         except GGUFError:
@@ -566,15 +604,15 @@ def _component_weights(directory):
     return all(any(Path(directory, name).glob("*.safetensors")) for name in names)
 
 
-def scan_mlx_outputs(roots, limit=MAX_SCAN_FILES):
+def scan_mlx_outputs(roots, limit=MAX_SCAN_FILES, errors=None):
     """Inventory MLX model directories beneath the configured roots."""
     outputs = []
     seen = set()
     for root in roots:
         base = Path(root).expanduser()
-        if not base.is_dir():
+        if not _readable_root(base, errors):
             continue
-        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False, onerror=lambda error: _scan_error(error, errors)):
             dirnames[:] = sorted(
                 name for name in dirnames
                 if name not in _SKIP_DIRECTORIES and not name.startswith(".")
@@ -1057,8 +1095,9 @@ def group_mlx_duplicates(outputs, signature=True, ollama=()):
 
 def inventory(gguf_roots, mlx_roots=(), receipts=(), signature=True, limit=MAX_SCAN_FILES):
     """One read-only pass: what exists, what is converted, what is redundant."""
-    entries = scan_gguf(gguf_roots, signature=signature, limit=limit)
-    outputs = scan_mlx_outputs(mlx_roots or gguf_roots, limit=limit)
+    errors = []
+    entries = scan_gguf(gguf_roots, signature=signature, limit=limit, errors=errors)
+    outputs = scan_mlx_outputs(mlx_roots or gguf_roots, limit=limit, errors=errors)
     ollama = scan_ollama(list(gguf_roots) + list(mlx_roots), signature=signature, limit=limit)
     paired = pair_conversions(entries, outputs, receipts)
     duplicates = group_duplicates(paired + _ollama_gguf_entries(ollama)) + group_mlx_duplicates(
@@ -1072,6 +1111,7 @@ def inventory(gguf_roots, mlx_roots=(), receipts=(), signature=True, limit=MAX_S
             "mlx": [str(Path(root).expanduser()) for root in (mlx_roots or gguf_roots)],
         },
         "models": paired,
+        "root_errors": errors,
         "outputs": outputs,
         "ollama": ollama,
         "pending": [item["path"] for item in pending],

@@ -120,6 +120,9 @@ def _add_discovery_arguments(parser):
     cache_group.add_argument("--offline", action="store_true", help="use only a matching local cache entry")
     parser.add_argument("--state-dir", help="directory for versioned discovery cache entries")
     parser.add_argument("--new", action="store_true", help="sort by most-recently-updated")
+    parser.add_argument("--sort", choices=["downloads", "trending", "likes", "newest"],
+                        help="rank each role by this Hugging Face order (newest: reputable publishers only)")
+    parser.add_argument("--search", help="match repository names on Hugging Face")
     parser.add_argument("--fast", action="store_true", help="skip per-model enrichment (name heuristics only)")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--wire", metavar="REPO", help="emit setup + config for a model, instead of discovering")
@@ -162,6 +165,8 @@ def _run_discovery(arguments, legacy):
         new=arguments.new,
         fast=arguments.fast,
         context_tokens=arguments.context_tokens,
+        sort=arguments.sort,
+        search=arguments.search,
     ))
     if fixture_warning:
         result = ResultEnvelope.ok("discover", result.data, warnings=[fixture_warning])
@@ -687,23 +692,41 @@ def _run_wire(arguments):
 _BENCH_RUNTIMES = ("ollama", "lmstudio", "mlx_lm", "mlx-vlm", "litellm")
 
 
-def _bench_runtime_client(name):
+_BENCH_ORIGINS = {"ollama": "http://127.0.0.1:11434", "lmstudio": "http://127.0.0.1:1234",
+                  "mlx-vlm": "http://127.0.0.1:8083", "mlx_lm": "http://127.0.0.1:8080", "litellm": "http://127.0.0.1:4000"}
+
+
+def _bench_runtime_client(name, base_url=None):
     from .verification import LMStudioRuntimeClient, MLXVLMRuntimeClient, OllamaRuntimeClient, OpenAICompatibleRuntimeClient
+    if name not in _BENCH_ORIGINS:
+        raise ValueError("unsupported bench runtime: {0}".format(name))
+    origin = base_url or _BENCH_ORIGINS[name]
     if name == "ollama":
-        return OllamaRuntimeClient()
+        return OllamaRuntimeClient(base_url=origin)
     if name == "lmstudio":
-        return LMStudioRuntimeClient()
+        return LMStudioRuntimeClient(base_url=origin)
     if name == "mlx-vlm":
-        return MLXVLMRuntimeClient()
-    if name == "mlx_lm":
-        return OpenAICompatibleRuntimeClient("mlx_lm", "http://127.0.0.1:8080")
-    if name == "litellm":
-        return OpenAICompatibleRuntimeClient("litellm", "http://127.0.0.1:4000")
-    raise ValueError("unsupported bench runtime: {0}".format(name))
+        return MLXVLMRuntimeClient(base_url=origin)
+    return OpenAICompatibleRuntimeClient(name, origin)
+
+
+def _require_unloaded_jit(origin, receipts_dir):
+    """A cold measurement needs an owned JIT endpoint at the origin whose model is unloaded."""
+    from urllib.parse import urlsplit
+    from .bench import BenchError
+    from .serve import status_serve
+    port = urlsplit(origin).port
+    entry = next((item for item in status_serve(receipts_dir) if item["port"] == port and item.get("jit")), None)
+    if entry is None:
+        raise BenchError("jit_required", "No owned JIT endpoint serves port {0}.".format(port),
+                         "Point --base-url at a serve start --jit endpoint and pass its --receipts-dir.")
+    if entry.get("model_state") != "unloaded":
+        raise BenchError("model_loaded", "The endpoint model is {0}, not unloaded.".format(entry.get("model_state")),
+                         "Run serve unload --port {0} first.".format(port))
 
 
 def _add_bench_arguments(parser):
-    from .bench import GEN_TOKENS_DEFAULT, RUNS_DEFAULT, TIMEOUT_DEFAULT
+    from .bench import CONCURRENCY_DEFAULT, GEN_TOKENS_DEFAULT, RUNS_DEFAULT, TIMEOUT_DEFAULT, WORKLOADS
     from .models import DISCOVERY_ROLES
     actions = parser.add_subparsers(dest="bench_command", required=True)
     run = actions.add_parser(
@@ -717,21 +740,38 @@ def _add_bench_arguments(parser):
     run.add_argument("--gen-tokens", type=int, default=GEN_TOKENS_DEFAULT, help="tokens generated per run (16-2048)")
     run.add_argument("--timeout", type=float, default=TIMEOUT_DEFAULT, help="total measurement deadline in seconds")
     run.add_argument("--export", default=None, help="append an anonymized result line to this JSONL file")
+    run.add_argument("--base-url", default=None, help="loopback origin of the runtime (default: its standard port)")
+    run.add_argument("--workload", default="chat", choices=WORKLOADS,
+                     help="chat, prefix (repeated 16k-token prefix), prefill (32k-token prompts), "
+                          "concurrent (parallel streams) or cold (first request to an unloaded JIT endpoint)")
+    run.add_argument("--concurrency", type=int, default=CONCURRENCY_DEFAULT, help="streams per run for --workload concurrent (2-8)")
+    run.add_argument("--receipts-dir", default=None, help="serve receipts base of the JIT endpoint for --workload cold")
     run.add_argument("--json", action="store_true")
     aggregate = actions.add_parser(
         "aggregate",
-        help="deduplicate and median-aggregate bench export files",
+        help="collect the latest bench exports per runtime, method and workload",
     )
     aggregate.add_argument("--exports", required=True, help="directory of .jsonl export files")
     aggregate.add_argument("--out", default=None, help="aggregate output path (default: print only)")
     aggregate.add_argument("--json", action="store_true")
+    coding = actions.add_parser("coding", help="run a fixed read-file and coding-edit correctness workload")
+    coding.add_argument("--repo", required=True, help="model identifier exactly as the runtime serves it")
+    coding.add_argument("--runtime", default="mlx_lm", choices=[name for name in _BENCH_RUNTIMES if name != "ollama"])
+    coding.add_argument("--base-url", default=None, help="loopback origin of the runtime")
+    coding.add_argument("--gen-tokens", type=int, default=512, help="maximum output tokens per request (256-1024)")
+    coding.add_argument("--timeout", type=float, default=180, help="total workload deadline, excluding inventory (1-600 seconds)")
+    coding.add_argument("--out", default=None, help="create a private JSON trace; refuses an existing file")
+    coding.add_argument("--json", action="store_true")
 
 
 def _run_bench(arguments):
     from .bench import BenchError, measure_runtime
     from .host import HostInventory
+    from .verification import _http_json_get
     operation = "bench-{0}".format(arguments.bench_command)
     try:
+        if arguments.bench_command == "coding":
+            return _run_coding_bench(arguments)
         if arguments.bench_command == "aggregate":
             from .bench import aggregate_exports
 
@@ -762,20 +802,31 @@ def _run_bench(arguments):
                     " -> {0}".format(arguments.out) if arguments.out else "",
                 ))
             return 0
+        from .bench import validate_workload
+        validate_workload(arguments.workload, arguments.runs, arguments.concurrency)
+        if arguments.export and arguments.workload != "chat":
+            raise ValueError("--export records the chat workload only")
+        client = _bench_runtime_client(arguments.runtime, arguments.base_url)
+        if arguments.workload == "cold":
+            _require_unloaded_jit(arguments.base_url or _BENCH_ORIGINS[arguments.runtime], arguments.receipts_dir)
         chip = None
         try:
-            chip = HostInventory.inspect().chip
+            host, _ = HostInventory.inspect(_http_json_get)
+            chip = host.chip
         except Exception:
             chip = None
         measurement = measure_runtime(
             arguments.repo,
-            _bench_runtime_client(arguments.runtime),
+            client,
             runs=arguments.runs,
             gen_tokens=arguments.gen_tokens,
             timeout=arguments.timeout,
             chip=chip,
+            workload=arguments.workload,
+            concurrency=arguments.concurrency,
         )
-        evidence = measurement.to_evidence(role=arguments.role).to_dict()
+        # Runtime-measured evidence is the chat probe; other workloads are diagnostics.
+        evidence = measurement.to_evidence(role=arguments.role).to_dict() if arguments.workload == "chat" else None
         data = {"measurement": measurement.to_dict(), "evidence": evidence}
         if arguments.export:
             from . import __version__
@@ -789,8 +840,9 @@ def _run_bench(arguments):
         if arguments.json:
             print(json.dumps(result.to_dict(), indent=2))
         else:
-            print("Bench: {0} on {1} ({2} runs)".format(
-                measurement.repo, measurement.runtime, measurement.runs
+            print("Bench: {0} on {1} ({2} runs{3})".format(
+                measurement.repo, measurement.runtime, measurement.runs,
+                "" if arguments.workload == "chat" else ", {0} workload".format(arguments.workload)
             ))
             ttft = "{0} ms".format(measurement.ttft_ms) if measurement.ttft_ms is not None else "n/a"
             prefill = (
@@ -798,9 +850,26 @@ def _run_bench(arguments):
                 if measurement.prefill_toks is not None
                 else "n/a"
             )
-            print("  decode:  {0} tok/s (spread {1}%)".format(measurement.decode_toks, measurement.spread_pct))
+            decode = (
+                "{0} tok/s (spread {1}%)".format(measurement.decode_toks, measurement.spread_pct)
+                if measurement.decode_toks is not None else "n/a"
+            )
+            end_to_end = (
+                "{0} tok/s".format(measurement.end_to_end_toks)
+                if measurement.end_to_end_toks is not None else "n/a"
+            )
+            print("  decode:  {0}".format(decode))
             print("  ttft:    {0}".format(ttft))
             print("  prefill: {0}".format(prefill))
+            print("  end-to-end: {0}".format(end_to_end))
+            print("  method:  {0}".format(measurement.measurement_method))
+            if arguments.workload != "chat":
+                details = measurement.to_dict()
+                for label, key, unit in (("first ttft", "first_ttft_ms", " ms"), ("cached", "cached_tokens", " tokens"),
+                                         ("prompt", "prompt_tokens", " tokens"), ("aggregate", "aggregate_end_to_end_toks", " tok/s")):
+                    if details.get(key) is not None:
+                        print("  {0:<8} {1}{2}".format(label + ":", details[key], unit))
+
         return 0
     except BenchError as error:
         result = ResultEnvelope.fail(operation, error.code, str(error), error.remediation)
@@ -821,6 +890,42 @@ def _run_bench(arguments):
     return 2
 
 
+def _run_coding_bench(arguments):
+    from .coding_bench import run_coding_workload, validate_coding_bounds
+    validate_coding_bounds(arguments.gen_tokens, arguments.timeout)
+    if arguments.timeout < 1:
+        raise ValueError("coding timeout must be at least one second")
+    # Reserve the trace before inference so an existing file cannot waste a run
+    # or be overwritten. The mode applies even under a permissive umask.
+    trace = None
+    if arguments.out:
+        try:
+            descriptor = os.open(arguments.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            trace = os.fdopen(descriptor, "w", encoding="utf-8")
+        except OSError as error:
+            raise ValueError("Cannot create the coding trace: {0}".format(error)) from error
+    try:
+        data = run_coding_workload(arguments.repo, _bench_runtime_client(arguments.runtime, arguments.base_url),
+                                   gen_tokens=arguments.gen_tokens, timeout=arguments.timeout)
+        if trace:
+            json.dump(data, trace, indent=2)
+            trace.write("\n")
+    finally:
+        if trace:
+            trace.close()
+    data = {key: value for key, value in data.items() if key != "transcript"}
+    data["trace"] = arguments.out
+    result = ResultEnvelope.ok("bench-coding", data)
+    if arguments.json:
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        print("Coding workload: {0}; {1} request(s), {2} ms".format(data["reason"], len(data["turns"]), data["elapsed_ms"]))
+        for turn in data["turns"]:
+            print("  {0}: {1} ms; cached tokens: {2} ({3})".format(
+                turn["name"], turn["elapsed_ms"], turn["cached_tokens"], turn["cache_source"] or "unknown"))
+    return 0 if data["quality_passed"] else 1
+
+
 def _add_serve_arguments(parser):
     from .serve import MAX_TOKENS_DEFAULT
     actions = parser.add_subparsers(dest="serve_command", required=True)
@@ -830,8 +935,11 @@ def _add_serve_arguments(parser):
     )
     start.add_argument("--repo", default=None, help="publisher/model present in the local Hugging Face cache")
     start.add_argument("--path", default=None, help="local model directory to serve instead of a cache repo id")
+    start.add_argument("--profile", help="saved Strata settings; explicit options override the profile")
     start.add_argument("--runtime", required=True, choices=["auto", "mlx_lm", "mlx-vlm", "strata"])
-    start.add_argument("--strata-speculation", choices=["on", "off"], help="opt-in draft-and-verify decoding for Strata profiles (default: off)")
+    decoding = start.add_mutually_exclusive_group()
+    decoding.add_argument("--strata-speculation", choices=["on", "off"], help="legacy Strata draft-and-verify switch (default: off)")
+    decoding.add_argument("--strata-decoding", choices=["plain", "lookup", "mtp"], help="Strata verified decoding mode; lookup needs no draft weights")
     start.add_argument("--strata-expert-memory-gb", type=float, help="Strata resident expert budget in decimal GB (0.5–64); other experts remain on disk")
     start.add_argument("--strata-context-tokens", type=int, help="Strata context capacity (512–131072 tokens)")
     start.add_argument("--port", type=int, default=None, help="loopback port (defaults per runtime recipe)")
@@ -844,6 +952,8 @@ def _add_serve_arguments(parser):
                        help="opt-in M5 affine Q4 prompt kernel; unsupported hardware/models use native MLX")
     start.add_argument("--prompt-lookup", action="store_true",
                        help="opt-in code-edit decoding; plain greedy requests run one at a time")
+    start.add_argument("--vision-cache", action="store_true",
+                       help="opt-in bounded Qwen2.5-VL and Qwen3-VL image feature reuse with MLX-VLM")
     start.add_argument("--jit", action="store_true", help="keep endpoint reachable; load local weights on inference requests")
     _add_memory_arguments(start)
     start.add_argument("--launchd", action="store_true", help="install a launchd agent plist instead of spawning now")
@@ -856,32 +966,77 @@ def _add_serve_arguments(parser):
     stop = actions.add_parser("stop", help="stop exactly the server a serve receipt owns")
     stop.add_argument("--port", type=int, required=True)
     stop.add_argument("--receipts-dir", default=None)
+    stop.add_argument("--expected-pid", type=int, default=None)
+    stop.add_argument("--expected-start", default=None, help="process start identity returned by service discovery")
     stop.add_argument("--json", action="store_true")
     unload = actions.add_parser("unload", help="release JIT model weights while keeping the endpoint reachable")
     unload.add_argument("--port", type=int, required=True)
     unload.add_argument("--expected-pid", type=int, default=None)
+    unload.add_argument("--expected-start", default=None)
     unload.add_argument("--receipts-dir", default=None)
     unload.add_argument("--json", action="store_true")
     policy = actions.add_parser("policy", help="configure owned JIT memory management without restarting")
     policy.add_argument("--port", type=int, required=True)
     policy.add_argument("--expected-pid", type=int, required=True)
+    policy.add_argument("--expected-start", default=None)
     policy.add_argument("--receipts-dir", default=None)
     policy.add_argument("--json", action="store_true")
-    _add_memory_arguments(policy)
+    _add_memory_arguments(policy, clear_budget=True)
     status = actions.add_parser("status", help="cross-check serve receipts against live processes")
     status.add_argument("--receipts-dir", default=None)
     status.add_argument("--json", action="store_true")
+    profiles = actions.add_parser("profile", help="save and reuse local Strata memory and decoding settings")
+    profile_actions = profiles.add_subparsers(dest="profile_command", required=True)
+    for command in ("save", "show", "list", "delete"):
+        action = profile_actions.add_parser(command)
+        if command != "list":
+            action.add_argument("name")
+        action.add_argument("--receipts-dir", default=None)
+        action.add_argument("--json", action="store_true")
+        if command == "save":
+            action.add_argument("--memory-budget-gb", type=float, required=True)
+            action.add_argument("--min-headroom-gb", type=float, required=True)
+            action.add_argument("--strata-context-tokens", type=int, default=16384)
+            action.add_argument("--strata-decoding", choices=["plain", "lookup", "mtp"], default="plain")
+            action.add_argument("--idle-timeout", type=int, default=300)
+            action.add_argument("--keep-loaded", action="store_true")
+            action.add_argument("--unload-under-pressure", action=argparse.BooleanOptionalAction, default=True)
+            action.add_argument("--replace", action="store_true")
+    discover = actions.add_parser("discover", help="find engine services across registered and live receipt locations")
+    discover.add_argument("--receipts-dir", action="append", default=[])
+    discover.add_argument("--json", action="store_true")
 
 
-def _add_memory_arguments(parser):
+def _add_memory_arguments(parser, clear_budget=False):
+    budgets = parser.add_mutually_exclusive_group()
+    budgets.add_argument("--memory-budget-gb", type=float, default=None,
+                        help="Strata JIT estimated total model-memory allowance in GB; default reserve: 2 GB")
+    if clear_budget:
+        budgets.add_argument("--clear-memory-budget", action="store_true",
+                             help="remove the model budget after active requests finish")
     parser.add_argument("--idle-timeout", type=int, default=None, help="unload after this many idle seconds (0 disables)")
-    parser.add_argument("--keep-loaded", action="store_true", help="prevent automatic idle unload after use")
+    parser.add_argument("--keep-loaded", action=argparse.BooleanOptionalAction, default=None, help="prevent automatic idle unload after use")
+    parser.add_argument("--unload-under-pressure", action=argparse.BooleanOptionalAction, default=None,
+                        help="guard loaded requests and unload idle workers below --min-headroom-gb")
     parser.add_argument("--min-headroom-gb", type=float, default=None, help="reserve GB beyond estimated weights and runtime allowance")
+    parser.add_argument("--context-tokens", type=int, default=None,
+                        help="also reserve the KV cache for this many context tokens (1024-1048576; needs --min-headroom-gb)")
 
 
 def _memory_arguments(arguments):
-    return {"idle_timeout_seconds": arguments.idle_timeout or 0, "keep_loaded": arguments.keep_loaded,
-            "minimum_headroom_gb": arguments.min_headroom_gb}
+    policy = {"idle_timeout_seconds": arguments.idle_timeout or 0, "keep_loaded": bool(arguments.keep_loaded),
+              "minimum_headroom_gb": arguments.min_headroom_gb}
+    if arguments.memory_budget_gb is not None:
+        policy["model_memory_budget_gb"] = arguments.memory_budget_gb
+    if getattr(arguments, "clear_memory_budget", False):
+        if arguments.memory_budget_gb is not None:
+            raise ValueError("Choose --memory-budget-gb or --clear-memory-budget.")
+        policy["model_memory_budget_gb"] = None
+    if arguments.context_tokens is not None:
+        policy["context_tokens"] = arguments.context_tokens
+    if arguments.unload_under_pressure:
+        policy["unload_under_pressure"] = True
+    return policy
 
 
 def _run_serve(arguments):
@@ -891,6 +1046,29 @@ def _run_serve(arguments):
     )
     operation = "serve-{0}".format(arguments.serve_command)
     try:
+        if arguments.serve_command == "profile":
+            from . import serve_profiles
+            command = arguments.profile_command
+            if command == "save":
+                keys = ("memory_budget_gb", "min_headroom_gb", "strata_context_tokens", "strata_decoding",
+                        "idle_timeout", "keep_loaded", "unload_under_pressure")
+                settings = {key: getattr(arguments, key) for key in keys}
+                result = {"name": arguments.name, "settings": serve_profiles.save_profile(
+                    arguments.name, settings, arguments.receipts_dir, replace=arguments.replace)}
+            elif command == "show":
+                result = {"name": arguments.name, "settings": serve_profiles.load_profile(arguments.name, arguments.receipts_dir)}
+            elif command == "list":
+                result = {"profiles": serve_profiles.list_profiles(arguments.receipts_dir)}
+            else:
+                serve_profiles.delete_profile(arguments.name, arguments.receipts_dir)
+                result = {"name": arguments.name, "deleted": True}
+            return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json,
+                                      human=json.dumps(result, indent=2))
+        if arguments.serve_command == "discover":
+            from .service_registry import discover_services
+            data = discover_services(arguments.receipts_dir)
+            return _emit_serve_result(ResultEnvelope.ok(operation, data), arguments.json,
+                                      human=_serve_status_human(data["services"]))
         if arguments.serve_command == "status":
             entries = status_serve(arguments.receipts_dir)
             return _emit_serve_result(
@@ -898,7 +1076,9 @@ def _run_serve(arguments):
                 human=_serve_status_human(entries),
             )
         if arguments.serve_command == "stop":
-            outcome = stop_serve(arguments.port, arguments.receipts_dir)
+            outcome = stop_serve(arguments.port, arguments.receipts_dir, **(
+                {**({"expected_pid": arguments.expected_pid} if arguments.expected_pid is not None else {}),
+                 **({"expected_start": arguments.expected_start} if arguments.expected_start is not None else {})}))
             return _emit_serve_result(
                 ResultEnvelope.ok(operation, outcome), arguments.json,
                 human="serve {0}: port {1} (pid {2})".format(
@@ -906,20 +1086,35 @@ def _run_serve(arguments):
                 ),
             )
         if arguments.serve_command == "unload":
-            outcome = unload_serve(arguments.port, arguments.receipts_dir, arguments.expected_pid)
+            outcome = unload_serve(arguments.port, arguments.receipts_dir, arguments.expected_pid, **(
+                {"expected_start": arguments.expected_start} if arguments.expected_start is not None else {}))
             return _emit_serve_result(ResultEnvelope.ok(operation, outcome), arguments.json,
                 human="Model unloaded; endpoint remains reachable on port {}.".format(arguments.port))
         if arguments.serve_command == "policy":
-            outcome = configure_serve_memory(arguments.port, _memory_arguments(arguments), arguments.receipts_dir, arguments.expected_pid)
+            outcome = configure_serve_memory(arguments.port, _memory_arguments(arguments), arguments.receipts_dir, arguments.expected_pid, **(
+                {"expected_start": arguments.expected_start} if arguments.expected_start is not None else {}))
             return _emit_serve_result(ResultEnvelope.ok(operation, outcome), arguments.json,
                                       human="JIT memory policy saved and applied on port {}.".format(arguments.port))
         recipes = load_recipes()
+        if arguments.profile:
+            from .serve_profiles import load_profile
+            settings = load_profile(arguments.profile, arguments.receipts_dir)
+            for key, value in settings.items():
+                if key == "strata_decoding" and arguments.strata_speculation is not None:
+                    continue
+                if key == "memory_budget_gb" and arguments.strata_expert_memory_gb is not None:
+                    continue
+                if getattr(arguments, key) is None:
+                    setattr(arguments, key, value)
         if arguments.training_receipt and arguments.launchd:
             raise ServeError("invalid_arguments", "Receipt-bound adapter serving requires supervised startup.",
                              "Use serve start without --launchd.")
         selected_runtime = "mlx_lm" if arguments.training_receipt and arguments.runtime == "auto" else arguments.runtime
         runtime, executable = resolve_serve_runtime(
             arguments.repo, arguments.path, selected_runtime, recipes, hf_cache=arguments.hf_cache)
+        if arguments.profile and runtime != "strata":
+            raise ServeError("invalid_arguments", "Saved serving profiles currently require Strata.",
+                             "Select a prepared Strata model or omit --profile.")
         if arguments.strata_speculation is not None and runtime != "strata":
             raise ServeError("invalid_arguments", "--strata-speculation requires the Strata runtime.", "Select a prepared local Strata profile.")
         plan = plan_start(
@@ -936,12 +1131,18 @@ def _run_serve(arguments):
             hf_cache=arguments.hf_cache,
             runtime_executable=executable,
             strata_speculation=arguments.strata_speculation == "on",
+            strata_decoding=arguments.strata_decoding,
             strata_expert_memory_gb=arguments.strata_expert_memory_gb,
             strata_context_tokens=arguments.strata_context_tokens,
-            memory_policy=_memory_arguments(arguments) if (arguments.idle_timeout is not None or arguments.keep_loaded or arguments.min_headroom_gb is not None) else None,
+            memory_policy=_memory_arguments(arguments) if (arguments.idle_timeout is not None or arguments.keep_loaded
+                                                           or arguments.min_headroom_gb is not None
+                                                           or arguments.context_tokens is not None
+                                                           or arguments.unload_under_pressure
+                                                           or arguments.memory_budget_gb is not None) else None,
             thinking=arguments.thinking,
             m5_prefill=arguments.m5_prefill,
             prompt_lookup=arguments.prompt_lookup,
+            vision_cache=arguments.vision_cache,
         )
         if arguments.launchd:
             if arguments.jit:
@@ -1283,16 +1484,25 @@ def _add_watch_arguments(parser):
                             help="watch state root (default ./.mlx-agent-watch)")
         action.add_argument("--limit", type=int, default=6,
                             help="discovery results per role (default 6)")
+        action.add_argument("--wired-root", action="append", default=None,
+                            help="exact client file or directory to inspect (repeatable; default current project)")
+        cache = action.add_mutually_exclusive_group()
+        cache.add_argument("--hf-cache", help="inspect only this Hugging Face cache")
+        cache.add_argument("--no-hf-cache", action="store_true", help="do not inspect a Hugging Face cache")
+        action.add_argument("--owned-repo", action="append", default=[],
+                            help="explicitly owned Hugging Face org/name ID (repeatable)")
         action.add_argument("--json", action="store_true")
 
 
 def _run_watch(arguments):
     from .discovery import DiscoveryRequest
     from .watch import (
-        WatchError, build_snapshot, collect_owned, diff_snapshots, read_baseline, snapshot_candidates, write_snapshot,
+        WatchError, build_snapshot, collect_owned, diff_snapshots, read_baseline,
+        snapshot_candidates, validate_owned_repos, write_snapshot,
     )
     operation = "watch-{0}".format(arguments.watch_command)
     try:
+        explicit = validate_owned_repos(arguments.owned_repo)
         service, fixture_warning, fixture_error = _discovery_service_from_environment()
         if fixture_error is not None:
             return _emit_wire_result(fixture_error, arguments.json)
@@ -1302,16 +1512,20 @@ def _run_watch(arguments):
             return _emit_wire_result(ResultEnvelope.fail(
                 operation, error["code"], error["message"], error["remediation"]
             ), arguments.json)
-        owned = collect_owned(_watch_runtime_clients())
+        evidence = {}
+        owned = collect_owned(_watch_runtime_clients(), hf_cache=arguments.hf_cache,
+                              wired_roots=arguments.wired_root, include_hf_cache=not arguments.no_hf_cache,
+                              owned_repos=explicit, evidence=evidence)
         candidates = snapshot_candidates(result.data)
         if arguments.watch_command == "snapshot":
-            snapshot = build_snapshot(owned, candidates)
+            snapshot = build_snapshot(owned, candidates, **evidence)
             destination = write_snapshot(arguments.state_dir, snapshot)
             data = {
                 "state": str(destination),
                 "owned": len(snapshot["owned"]),
                 "candidates": len(snapshot["candidates"]),
                 "rotated_previous": snapshot["previous"] is not None,
+                **evidence,
             }
             result = ResultEnvelope.ok(operation, data)
             if arguments.json:
@@ -1322,11 +1536,12 @@ def _run_watch(arguments):
                 ))
             return 0
         baseline = read_baseline(arguments.state_dir)
-        current = build_snapshot(owned, candidates)
+        current = build_snapshot(owned, candidates, **evidence)
         findings = diff_snapshots(baseline, current)
         data = {
             "baseline_created_at": baseline["created_at"],
             "findings": findings,
+            **evidence,
         }
         warnings = [
             {"code": finding["code"], "message": "{0}: {1}".format(finding["repo"], finding["detail"])}
@@ -1574,7 +1789,7 @@ def _run_backend(arguments):
 
 
 def _add_convert_arguments(parser):
-    from .convert import Q_BITS_CHOICES
+    from .convert import Q_BITS_CHOICES, UNQUANTIZED_BITS
     actions = parser.add_subparsers(dest="convert_command", required=True)
     start = actions.add_parser(
         "start",
@@ -1592,7 +1807,7 @@ def _add_convert_arguments(parser):
         help="model_type from intake resolve; selects a port's own converter when it ships one",
     )
     start.add_argument("--subfolder", default=None, help="checkpoint folder inside the repository (converts from the cache)")
-    start.add_argument("--q-bits", type=int, default=4, choices=Q_BITS_CHOICES)
+    start.add_argument("--q-bits", type=int, default=4, choices=Q_BITS_CHOICES + (UNQUANTIZED_BITS,))
     start.add_argument("--out", default=None, help="output directory (default <model>-MLX-<bits>bit)")
     start.add_argument("--confirm", action="store_true", help="authorize this reviewed conversion")
     start.add_argument("--preview-hash", help="hash returned by the separately reviewed convert preview")
@@ -1689,6 +1904,19 @@ def _add_convert_arguments(parser):
     describe.add_argument("--max-pixels", type=int, default=None, help="shrink the media to at most this many pixels")
     describe.add_argument("--timeout", type=int, default=900, help="seconds before the backend run is stopped")
     describe.add_argument("--json", action="store_true")
+    mesh = actions.add_parser("mesh", help="generate a GLB mesh from an image using a converted MLX model")
+    mesh.add_argument("--path", required=True)
+    mesh.add_argument("--image", required=True)
+    mesh.add_argument("--out", required=True)
+    mesh.add_argument("--steps", type=int, default=None, help="default: the model's own (TripoSG 50)")
+    mesh.add_argument("--seed", type=int, default=42)
+    mesh.add_argument("--resolution", type=int, default=None,
+                      help="TripoSG 32, 64, 128, 256 or 512 (default); TRELLIS.2 512, 1024 (default) or 1536; "
+                           "Pixal3D 1024 or 1536 (default)")
+    mesh.add_argument("--guidance", type=float, default=None, help="default: the model's own (TripoSG 7)")
+    mesh.add_argument("--max-faces", type=int, default=500000)
+    mesh.add_argument("--timeout", type=int, default=3600)
+    mesh.add_argument("--json", action="store_true")
     video = actions.add_parser(
         "video",
         help="render one prompt with a converted text-to-video model to a new MP4 (verification canary)",
@@ -1719,6 +1947,7 @@ def _run_convert(arguments):
     from .speak import plan_speak, run_speak
     from .transcribe import plan_transcribe, run_transcribe
     from .video import plan_video, run_video
+    from .mesh import plan_mesh, run_mesh
     operation = "convert-{0}".format(arguments.convert_command)
     try:
         if arguments.convert_command == "status":
@@ -1777,6 +2006,15 @@ def _run_convert(arguments):
             from .compute import guarded_start
             result = guarded_start("describe", run_describe, plan, timeout=arguments.timeout)
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["text"])
+        if arguments.convert_command == "mesh":
+            if not 1 <= arguments.timeout <= 14400:
+                raise ValueError("--timeout must be 1..14400 seconds")
+            plan = plan_mesh(arguments.path, arguments.image, arguments.out, steps=arguments.steps,
+                             seed=arguments.seed, resolution=arguments.resolution, guidance=arguments.guidance,
+                             max_faces=arguments.max_faces)
+            from .compute import guarded_start
+            result = guarded_start("mesh", run_mesh, plan, timeout=arguments.timeout)
+            return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["path"])
         if arguments.convert_command == "video":
             if not 1 <= arguments.timeout <= 14400:
                 raise ValueError("--timeout must be 1..14400 seconds")
@@ -1863,7 +2101,8 @@ def _convert_scan(arguments):
     from .convert import ConvertError, load_receipts
     from .gguf import MAX_SCAN_FILES, default_gguf_roots, inventory
     from .taxonomy import annotate_inventory
-    roots = arguments.gguf_roots or default_gguf_roots()
+    roots = arguments.gguf_roots if arguments.gguf_roots is not None else (
+        [] if arguments.mlx_roots is not None else default_gguf_roots())
     if not roots and not arguments.mlx_roots:
         raise ConvertError(
             "no_scan_roots",
@@ -2225,11 +2464,13 @@ def _add_doctor_arguments(parser):
         default=None,
         help="root scanned for Wire-managed configs (repeatable; defaults to the project root)",
     )
-    parser.add_argument(
+    cache = parser.add_mutually_exclusive_group()
+    cache.add_argument(
         "--hf-cache",
         default=None,
         help="Hugging Face cache root (defaults to ~/.cache/huggingface/hub)",
     )
+    cache.add_argument("--no-hf-cache", action="store_true", help="check wired configurations without reading a model cache")
     parser.add_argument(
         "--prune",
         action="store_true",
@@ -2249,8 +2490,11 @@ def _run_model_doctor(arguments):
 
     operation = "doctor-models"
     wired_roots = arguments.wired_root or [arguments.project]
-    hf_cache = arguments.hf_cache or default_hf_cache()
+    hf_cache = None if arguments.no_hf_cache else (arguments.hf_cache or default_hf_cache())
     if arguments.prune:
+        if arguments.no_hf_cache:
+            return _emit_serve_result(ResultEnvelope.fail(operation, "invalid_arguments", "Cache pruning requires a cache.",
+                                      "Remove --no-hf-cache before reviewing cache cleanup."), arguments.json, human="Cache pruning requires a cache.")
         try:
             plan = plan_prune(hf_cache)
             outcome = execute_prune(
@@ -2451,6 +2695,8 @@ def build_parser(command=None):
         return command is None or command == name
 
     parser = argparse.ArgumentParser(description="MLX agent command-line core.")
+    from . import __version__
+    parser.add_argument("--version", action="version", version="mlx-agent " + __version__)
     subcommands = parser.add_subparsers(dest="command", required=True)
     task = subcommands.add_parser("task", help="durable local inference tasks")
     if wanted("task"):
