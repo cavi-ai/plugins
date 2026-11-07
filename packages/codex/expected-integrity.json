@@ -1,9 +1,9 @@
 {
   "mlx-agent": {
     "repository": "cavi-ai/mlx-agent",
-    "source_commit": "fb9b13baf57ab07b69ee2d7e6ed00de9f7efb995",
+    "source_commit": "fc585f36abdd9d47614327afec4719fa9049d729",
     "source_path": "providers/codex",
-    "tree": "ba0015820de4cf77aa487807a500da56ede3926896c28f75ca93ca219417e213",
+    "tree": "b08974c6522c5e049f882f82bb3395fa91b6cf29669345a0b44c897f847dc73d",
     "skills": [
       "mlx-adopt",
       "mlx-bench",

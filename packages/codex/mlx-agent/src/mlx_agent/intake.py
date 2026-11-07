@@ -6,10 +6,12 @@ import fnmatch
 import http.client
 import json
 import math
+import re
 
 from .backends import (
-    choose_backend, component_matches, load_manifests, load_registries, lookup, port_bits, port_files,
-    port_for_files, port_for_pipeline, quantize_rule, recipe_for, snapshot_files,
+    QUANTIZED_BITS, choose_backend, component_matches, conversion_bits, load_manifests, load_registries, lookup,
+    port_downloads, port_files, port_for_files, port_for_pipeline, port_requirements, quantize_rule, recipe_for,
+    snapshot_files,
 )
 from .huggingface import HuggingFaceClient, HuggingFaceHTTPError
 from .intake_fetch import FETCH_IGNORE_PATTERNS
@@ -19,7 +21,7 @@ from .taxonomy import classify
 INTAKE_SCHEMA = "intake/1"
 TRANSPORT_ERRORS = (OSError, TimeoutError, http.client.HTTPException, ValueError)
 _BLOCKING_STATUSES = (401, 403, 404, 410)
-ESTIMATE_BITS = (4, 8)
+ESTIMATE_BITS = QUANTIZED_BITS
 ESTIMATE_MAX_SHARDS = 16
 QUANT_GROUP_SIZE = 64
 _DTYPE_BYTES = {
@@ -217,6 +219,20 @@ def recipe_download_bytes(client, recipe, files, warnings):
     return lora + download_bytes(base, None, {})
 
 
+def requirement_download_bytes(client, requires, warnings):
+    """The files a port reads from other repositories, which ``intake fetch`` downloads with the snapshot."""
+    total = 0
+    for repo, names in sorted(requires.items()):
+        try:
+            info = client.fetch_model_info(repo)
+        except (HuggingFaceHTTPError,) + TRANSPORT_ERRORS as error:
+            warnings.append("{0} size unavailable: {1}".format(repo, error))
+            continue
+        sizes = summarize_files(info if isinstance(info, dict) else {})["sizes"]
+        total += sum(sizes.get(name, 0) for name in names)
+    return total
+
+
 def download_bytes(files, model_type, manifests):
     """What ``intake fetch`` of the snapshot takes: a ported type's files, else every file but ignored formats."""
     ported = snapshot_files(model_type, manifests)
@@ -319,6 +335,12 @@ def resolve(text, revision=None, client=None, manifests=None, registries=None):
         payload["warnings"].append("the model API returned a non-object document")
         return payload
 
+    resolved = _text(info.get("sha"))
+    if resolved and re.fullmatch(r"[0-9a-fA-F]{40}", resolved):
+        payload["source"]["resolved_revision"] = resolved
+        source["revision"] = resolved
+        payload["source"]["url"] = _source_url(source)
+
     subfolder = source.get("subfolder")
     prefix = subfolder + "/" if subfolder else ""
     files = scope_files(info, subfolder)
@@ -357,7 +379,9 @@ def resolve(text, revision=None, client=None, manifests=None, registries=None):
     )
     payload["download_bytes"] = (
         recipe_download_bytes(client, recipe, files, payload["warnings"]) if recipe
-        else download_bytes(files, payload["model_type"], manifests)
+        else download_bytes(files, payload["model_type"], manifests) + requirement_download_bytes(
+            client, port_requirements(payload["model_type"], manifests), payload["warnings"])
+        + sum(entry["size"] for entry in port_downloads(payload["model_type"], manifests))
     )
     payload["cached"] = recipe is None and snapshot_cached(
         source["repo"], _text(info.get("sha")), files["names"], prefix, payload["model_type"], manifests)
@@ -375,7 +399,7 @@ def resolve(text, revision=None, client=None, manifests=None, registries=None):
     if verdict != "already_mlx" and not subfolder:
         payload["mlx_conversions"] = list_mlx_conversions(client, source["repo"], payload["warnings"])
     if verdict in ("convertible", "convertible_after_install"):
-        payload["q_bits"] = port_bits(payload["model_type"], backend, manifests) or list(ESTIMATE_BITS)
+        payload["q_bits"] = conversion_bits(payload["model_type"], backend, manifests)
     # A recipe's weights come from its base repository and a pipeline's from component folders,
     # whose quantization the header estimate does not model: no estimate rather than a wrong one.
     if verdict in ("convertible", "convertible_after_install") and not recipe and not pipeline:
