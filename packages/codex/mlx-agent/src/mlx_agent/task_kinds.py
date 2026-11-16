@@ -12,10 +12,12 @@ from typing import Callable, Dict, Optional
 
 from .backends import backend_environment
 from .decide import plan_decide, run_decide, validate_request as validate_decision
+from .embed import plan_embed, run_embed, validate_parameters as validate_embedding
 from .describe import plan_describe, run_describe
 from .generate import plan_generate, run_generate
 from .inference_runner import InferenceError
 from .music import plan_music, run_music, validate_parameters as validate_music
+from .mesh import MeshError, plan_mesh, run_mesh, validate_glb
 from .speak import plan_speak, run_speak
 from .task_contracts import (MEDIA_REQUEST_SCHEMA, MEDIA_RUN_SCHEMA, REQUEST_SCHEMA, RUN_SCHEMA, TaskError,
                              absolute_path, encoded, finite_number)
@@ -53,8 +55,8 @@ class TaskKind:
         output = str(Path(directory) / self.output) if self.output else None
         return self.planner(request["model_path"], parameters, output, media, Path(directory))
 
-    def run(self, plan):
-        return self.runner(plan)
+    def run(self, plan, runner=None):
+        return self.runner(plan, **({"runner": runner} if runner is not None else {}))
 
     def check_output(self, path, plan):
         """Fail closed unless the run left a usable output artifact at `path`."""
@@ -122,10 +124,12 @@ def _validate_classification(parameters):
 
 
 def _validate_music(parameters):
-    if "caption" not in parameters or set(parameters) - {"caption", "lyrics", "duration", "steps", "seed"}:
+    allowed = {"caption", "lyrics", "duration", "steps", "seed", "bpm", "time_signature", "reference"}
+    if "caption" not in parameters or set(parameters) - allowed:
         raise _invalid("Music parameters need a caption and supported generation settings.")
     return validate_music(parameters["caption"], parameters.get("lyrics", "[instrumental]"),
-                          parameters.get("duration", 15.0), parameters.get("steps", 30), parameters.get("seed", 42))
+                          parameters.get("duration", 15.0), parameters.get("steps", 30), parameters.get("seed", 42),
+                          parameters.get("bpm"), parameters.get("time_signature"), parameters.get("reference"))
 
 
 def _validate_transcribe(parameters):
@@ -164,10 +168,16 @@ def _validate_image_understanding(parameters):
 
 
 def _validate_video_generation(parameters):
-    _require_keys(parameters, ("prompt",), ("width", "height", "frames", "steps", "seed", "fps"),
+    _require_keys(parameters, ("prompt",), ("width", "height", "frames", "steps", "seed", "fps", "denoiser_cache", "cache_memory_mib"),
                   "Video-generation parameters need prompt and supported options.")
     _require_string(parameters, "prompt")
-    _require_integer(parameters, "width", "height", "frames", "steps", "seed")
+    _require_integer(parameters, "width", "height", "frames", "steps", "seed", "cache_memory_mib")
+    if "cache_memory_mib" in parameters and not 8 <= parameters["cache_memory_mib"] <= 4096:
+        raise TaskError("invalid_parameters", "cache_memory_mib must be 8..4096.")
+    if "denoiser_cache" in parameters:
+        _require_string(parameters, "denoiser_cache")
+        if parameters["denoiser_cache"] not in ("off", "adaptive"):
+            raise TaskError("invalid_parameters", "denoiser_cache must be off or adaptive.")
     _require_finite(parameters, "fps")
     return parameters
 
@@ -182,6 +192,27 @@ def _validate_video_understanding(parameters):
     return parameters
 
 
+def _validate_mesh(parameters):
+    _require_keys(parameters, ("image_path",), ("steps", "seed", "resolution", "guidance", "max_faces", "denoiser_cache", "cache_memory_mib"),
+                  "Mesh-generation parameters need image_path and supported generation settings.")
+    _require_absolute(parameters, "image_path")
+    _require_integer(parameters, "steps", "seed", "resolution", "max_faces", "cache_memory_mib")
+    if 'cache_memory_mib' in parameters and not 8 <= parameters['cache_memory_mib'] <= 4096:
+        raise TaskError('invalid_parameters', 'cache_memory_mib must be 8..4096.')
+    if 'denoiser_cache' in parameters:
+        _require_string(parameters, 'denoiser_cache')
+        if parameters['denoiser_cache'] not in ('off','adaptive'):
+            raise TaskError('invalid_parameters', 'denoiser_cache must be off or adaptive.')
+    _require_finite(parameters, "guidance")
+    return parameters
+
+
+def _plan_embedding(model, parameters, output, media, directory):
+    path = directory / "embedding.json"
+    write_json(path, parameters)
+    return plan_embed(model, str(path))
+
+
 def _plan_classification(model, parameters, output, media, directory):
     path = directory / "decision.json"
     write_json(path, parameters)
@@ -190,7 +221,9 @@ def _plan_classification(model, parameters, output, media, directory):
 
 def _plan_music(model, parameters, output, media, directory):
     return plan_music(model, parameters["caption"], parameters["lyrics"], output,
-                      duration=parameters["duration"], steps=parameters["steps"], seed=parameters["seed"])
+                      duration=parameters["duration"], steps=parameters["steps"], seed=parameters["seed"],
+                      bpm=parameters.get("bpm"), time_signature=parameters.get("time_signature"),
+                      reference=parameters.get("reference"))
 
 
 def _plan_transcribe(model, parameters, output, media, directory):
@@ -212,12 +245,23 @@ def _plan_image_understanding(model, parameters, output, media, directory):
 
 def _plan_video_generation(model, parameters, output, media, directory):
     return plan_video(model, parameters["prompt"], output,
-                      **_options(parameters, ("width", "height", "frames", "fps", "steps", "seed")))
+                      **_options(parameters, ("width", "height", "frames", "fps", "steps", "seed", "denoiser_cache", "cache_memory_mib")))
 
 
 def _plan_video_understanding(model, parameters, output, media, directory):
     return plan_describe(model, parameters["prompt"], video=media,
                          **_options(parameters, ("fps", "max_tokens", "temperature", "max_pixels")))
+
+
+def _plan_mesh(model, parameters, output, media, directory):
+    return plan_mesh(model, media, output, **_options(parameters, ("steps", "seed", "resolution", "guidance", "max_faces", "denoiser_cache", "cache_memory_mib")))
+
+
+def _check_mesh_output(path, plan):
+    try:
+        validate_glb(path)
+    except MeshError as error:
+        raise TaskError("invalid_mesh_output", str(error), error.remediation) from error
 
 
 def _wav_check(activity):
@@ -267,22 +311,25 @@ check_mp4 = _backend_validator("task_mp4_validator.py", "invalid_video_output",
 
 
 KINDS: Dict[str, TaskKind] = {kind.name: kind for kind in (
+    TaskKind("embedding", "embed/1", False, validate_embedding, _plan_embedding, lambda plan, **options: run_embed(plan, **options)),
     TaskKind("classification", "decide/1", True, _validate_classification, _plan_classification,
-             lambda plan: run_decide(plan)),
-    TaskKind("music_generation", "music/1", True, _validate_music, _plan_music, lambda plan: run_music(plan),
+             lambda plan, **options: run_decide(plan, **options)),
+    TaskKind("music_generation", "music/1", True, _validate_music, _plan_music, lambda plan, **options: run_music(plan, **options),
              output="output.wav", output_check=_wav_check("Music generation")),
     TaskKind("transcribe", "transcribe/1", False, _validate_transcribe, _plan_transcribe,
-             lambda plan: run_transcribe(plan), input_field="audio_path", input_media="audio"),
-    TaskKind("speak", "speak/1", False, _validate_speak, _plan_speak, lambda plan: run_speak(plan),
+             lambda plan, **options: run_transcribe(plan, **options), input_field="audio_path", input_media="audio"),
+    TaskKind("speak", "speak/1", False, _validate_speak, _plan_speak, lambda plan, **options: run_speak(plan, **options),
              output="output.wav", output_check=_wav_check("Speech synthesis")),
     TaskKind("image_generation", "generate/1", False, _validate_image_generation, _plan_image_generation,
-             lambda plan: run_generate(plan), output="output.png", output_check=lambda path, plan: check_png(path, plan)),
+             lambda plan, **options: run_generate(plan, **options), output="output.png", output_check=lambda path, plan: check_png(path, plan)),
     TaskKind("image_understanding", "describe/1", False, _validate_image_understanding, _plan_image_understanding,
-             lambda plan: run_describe(plan), input_field="image_path", input_media="image"),
+             lambda plan, **options: run_describe(plan, **options), input_field="image_path", input_media="image"),
     TaskKind("video_generation", "video/1", False, _validate_video_generation, _plan_video_generation,
-             lambda plan: run_video(plan), output="output.mp4", output_check=lambda path, plan: check_mp4(path, plan)),
+             lambda plan, **options: run_video(plan, **options), output="output.mp4", output_check=lambda path, plan: check_mp4(path, plan)),
     TaskKind("video_understanding", "describe/1", False, _validate_video_understanding, _plan_video_understanding,
-             lambda plan: run_describe(plan), input_field="video_path", input_media="video"),
+             lambda plan, **options: run_describe(plan, **options), input_field="video_path", input_media="video"),
+    TaskKind("mesh_generation", "mesh/1", False, _validate_mesh, _plan_mesh, lambda plan, **options: run_mesh(plan, **options),
+             input_field="image_path", input_media="image", output="output.glb", output_check=_check_mesh_output),
 )}
 
 

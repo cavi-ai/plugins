@@ -13,8 +13,9 @@ import os
 import re
 import struct
 from pathlib import Path
+from stat import S_ISREG
 
-from .backends import QUANTIZED_BITS
+from .backends import QUANTIZED_BITS, CONVERSION_BITS
 
 
 MAX_SCAN_FILES = 4000
@@ -53,9 +54,8 @@ _DRAFT_PORTS = (("deepseek_v4_dspark", "dflash", "dflash.hyper_connection.count"
 ARCHITECTURE_PORTS = {"qwen35": "qwen35"}
 # The llama.cpp vision projector type each port attaches from the model's folder.
 PORT_PROJECTORS = {"qwen35": "qwen3vl_merger"}
-# Ports converted from GGUF quantize through their own tensor maps, checked at these widths only;
-# other GGUFs convert at every quantized width.
-GGUF_PORT_BITS = (4, 8)
+# Port-specific output widths; DSpark retains MXFP4 experts and cannot offer floating output.
+GGUF_PORT_BITS = {"qwen35": CONVERSION_BITS, "deepseek_v4_dspark": QUANTIZED_BITS}
 _MIN_NAME_MATCH = 6
 # Trailing MLX quantization labels in folder names: Foo-MLX-4bit, Foo-4.4bpw, Foo-bf16, Foo-mxfp8.
 _MLX_QUANT_SUFFIX = re.compile(
@@ -73,8 +73,16 @@ _MLX_STRUCTURE_KEYS = (
     "model_type", "hidden_size", "num_hidden_layers", "intermediate_size",
     "num_attention_heads", "num_key_value_heads", "vocab_size",
 )
+# Task types that never stand in for a generator of the same architecture.
+_SEPARATE_TASKS = ("embedding", "classification")
+# Dimensions GGUF headers and config.json files both record: layers, hidden width, attention heads.
+_SHAPE_GGUF_SUFFIXES = (".block_count", ".embedding_length", ".attention.head_count")
+_SHAPE_CONFIG_KEYS = ("num_hidden_layers", "hidden_size", "num_attention_heads")
 _INTERESTING_KEYS = (
     "general.architecture",
+    "general.type",
+    "general.base_model.0.name",
+    "general.base_model.0.repo_url",
     "general.name",
     "general.basename",
     "general.size_label",
@@ -83,6 +91,8 @@ _INTERESTING_KEYS = (
     "general.parameter_count",
     "clip.projector_type",
     "clip.vision.projection_dim",
+    "qwen4exp.expert_count",
+    "qwen4exp.expert_feed_forward_length",
 )
 _STRUCTURE_SUFFIXES = (
     ".block_count",
@@ -341,6 +351,35 @@ def _structure(metadata, tensor_count):
     return hashlib.sha256("|".join(fields).encode("utf-8")).hexdigest()[:16]
 
 
+def _shape(architecture, layers, width, heads):
+    """A fingerprint of a model's architecture and size that is the same in every format, else None."""
+    if not isinstance(architecture, str) or not architecture:
+        return None
+    if not all(isinstance(value, int) and not isinstance(value, bool) and value > 0 for value in (layers, width, heads)):
+        return None
+    family = re.sub(r"[^a-z0-9]", "", architecture.lower())
+    return hashlib.sha256("{0}|{1}|{2}|{3}".format(family, layers, width, heads).encode("utf-8")).hexdigest()[:16]
+
+
+def _gguf_shape(metadata):
+    architecture = metadata.get("general.architecture")
+    layers, width, heads = (metadata.get("{0}{1}".format(architecture, suffix)) for suffix in _SHAPE_GGUF_SUFFIXES)
+    predicted = metadata.get("{0}.nextn_predict_layers".format(architecture))
+    if isinstance(layers, int) and isinstance(predicted, int) and 0 < predicted < layers:
+        # block_count includes the multi-token-prediction blocks; config.json counts them apart.
+        layers -= predicted
+    return _shape(architecture, layers, width, heads)
+
+
+def _config_shape(value):
+    """The :func:`_shape` of a config.json object, read from its text_config when it has one."""
+    if not isinstance(value, dict):
+        return None
+    nested = value.get("text_config") if isinstance(value.get("text_config"), dict) else {}
+    layers, width, heads = (value.get(key, nested.get(key)) for key in _SHAPE_CONFIG_KEYS)
+    return _shape(value.get("model_type", nested.get("model_type")), layers, width, heads)
+
+
 def _prediction_only(metadata, architecture, tensor_count):
     """A multi-token-prediction export: llama.cpp's nextn block without the layers it predicts from."""
     layers = metadata.get("{0}.nextn_predict_layers".format(architecture))
@@ -367,10 +406,10 @@ def conversion_bits(entry):
     draft = entry.get("draft")
     port = draft.get("port") if draft is not None else entry.get("port")
     if port is not None:
-        return list(GGUF_PORT_BITS)
+        return list(GGUF_PORT_BITS.get(port, ()))
     if draft is not None or entry.get("companion") or not entry.get("readable"):
         return []
-    return list(QUANTIZED_BITS)
+    return list(CONVERSION_BITS)
 
 
 def describe_gguf(path, signature=True):
@@ -400,6 +439,7 @@ def describe_gguf(path, signature=True):
         "quantization": "unknown",
         "parameters": None,
         "structure": None,
+        "shape": None,
         "signature": None,
         "companion": any(token in stem.lower() for token in _COMPANION_NAMES),
         "draft": None,
@@ -419,10 +459,21 @@ def describe_gguf(path, signature=True):
     entry["architecture"] = metadata.get("general.architecture")
     entry["companion"] = (
         any(token in stem.lower() for token in _COMPANION_NAMES)
+        or str(metadata.get("general.type") or "").lower() == "mmproj"
         or str(entry["architecture"]).lower() in _COMPANION_ARCHITECTURES
     )
+    identity = {
+        "artifact_kind": metadata.get("general.type"),
+        "declared_size": metadata.get("general.size_label"),
+        "base_model_name": metadata.get("general.base_model.0.name"),
+        "base_model_repo": metadata.get("general.base_model.0.repo_url"),
+        "projector_type": metadata.get("clip.projector_type"),
+        "projector_width": metadata.get("clip.vision.projection_dim"),
+    }
+    entry["identity"] = {key: value for key, value in identity.items() if value is not None}
     entry["quantization"] = _quantization(metadata, stem)
     entry["structure"] = _structure(metadata, header["tensor_count"])
+    entry["shape"] = _gguf_shape(metadata)
     entry["tensor_count"] = header["tensor_count"]
     parameters = metadata.get("general.parameter_count")
     if isinstance(parameters, int) and not isinstance(parameters, bool):
@@ -629,10 +680,14 @@ def scan_mlx_outputs(roots, limit=MAX_SCAN_FILES, errors=None):
                 resolved = directory.resolve()
                 if resolved not in seen:
                     seen.add(resolved)
+                    try:
+                        shape = _gguf_shape(read_gguf_header(profile["gguf"])["metadata"])
+                    except GGUFError:
+                        shape = None
                     outputs.append({"path": str(directory), "name": directory.name,
                                     "model_key": _normalize_stem(directory.name), "quantization": None,
                                     "provenance": None, "runtime": "strata", "format": "gguf",
-                                    "weight_bytes": profile["weight_bytes"]})
+                                    "weight_bytes": profile["weight_bytes"], "shape": shape, "repo": None})
                 dirnames[:] = []
                 if len(seen) >= limit:
                     return sorted(outputs, key=lambda item: item["path"])
@@ -653,12 +708,21 @@ def scan_mlx_outputs(roots, limit=MAX_SCAN_FILES, errors=None):
                 continue
             seen.add(resolved)
             dirnames[:] = []
+            precision = None
+            if provenance and provenance.get("q_bits") in (16, 32) and marker is None:
+                bits = provenance["q_bits"]
+                source = provenance.get("source") or {}
+                explicit_float = source.get("kind") == "gguf" or (provenance.get("tool") == "mlx-agent.convert" and provenance.get("backend") == "mlx-lm")
+                precision = "FP%d" % bits if explicit_float else "Unquantized"
             outputs.append({
+                "precision": precision,
                 "path": str(directory),
                 "name": directory.name,
                 "model_key": _normalize_stem(directory.name),
                 "quantization": marker,
                 "provenance": provenance,
+                "shape": _config_shape(_read_json_object(directory / "config.json", MAX_CONFIG_BYTES)),
+                "repo": _hf_repo(directory),
             })
             if len(seen) >= limit:
                 return sorted(outputs, key=lambda item: item["path"])
@@ -788,6 +852,11 @@ def _hf_snapshot(directory):
     return len(parts) >= 3 and parts[-2] == "snapshots" and parts[-3].startswith("models--")
 
 
+def _hf_repo(directory):
+    """The ``owner/name`` repository of a Hugging Face cache snapshot, else None."""
+    return Path(directory).parts[-3][len("models--"):].replace("--", "/", 1) if _hf_snapshot(directory) else None
+
+
 def _mlx_name(directory):
     """Folder name of an MLX model; a cache snapshot uses its repository name."""
     return Path(directory).parts[-3].split("--")[-1] if _hf_snapshot(directory) else Path(directory).name
@@ -857,7 +926,7 @@ def _mlx_files(directory):
 def _mlx_quantization(output):
     marker = output.get("quantization")
     bits = marker.get("bits") if isinstance(marker, dict) else None
-    return "{0}-bit".format(bits) if isinstance(bits, int) and not isinstance(bits, bool) else "unknown"
+    return "{0}-bit".format(bits) if isinstance(bits, int) and not isinstance(bits, bool) else output.get("precision") or "unknown"
 
 
 def _ollama_stores(roots):
@@ -914,6 +983,7 @@ def _describe_ollama(store, tree, manifest, signature):
         "name": name,
         "path": str(manifest),
         "blob": None,
+        "blobs": sorted({str(blob) for _kind, _layer, blob in described} | ({str(config_blob)} if config_blob else set())),
         "bytes": sum(size for size in sizes.values() if isinstance(size, int) and not isinstance(size, bool)),
         "modified_at": int(manifest.stat().st_mtime),
     }
@@ -926,7 +996,7 @@ def _describe_ollama(store, tree, manifest, signature):
         record.update(
             format="gguf", blob=str(gguf), architecture=entry["architecture"], model_key=entry["model_key"],
             quantization=entry["quantization"], structure=entry["structure"], signature=entry["signature"],
-            readable=entry["readable"], draft=entry["draft"],
+            readable=entry["readable"], draft=entry["draft"], shape=entry["shape"],
         )
     elif any(kind == "tensor" for kind, _layer, _blob in described):
         settings = next((_read_json_object(blob, MAX_CONFIG_BYTES) for kind, layer, blob in described
@@ -939,6 +1009,7 @@ def _describe_ollama(store, tree, manifest, signature):
             format="safetensors", architecture=settings.get("model_type"),
             model_key=_mlx_name_key("{0}-{1}".format(model, tag)), quantization=label,
             structure=_config_structure(settings), signature=None, readable=True, draft=None,
+            shape=_config_shape(settings),
         )
     else:
         return None
@@ -1093,7 +1164,211 @@ def group_mlx_duplicates(outputs, signature=True, ollama=()):
     return groups
 
 
-def inventory(gguf_roots, mlx_roots=(), receipts=(), signature=True, limit=MAX_SCAN_FILES):
+def _stored_file(location):
+    """A file's identity on disk (links followed), path and size; None when it cannot be read."""
+    try:
+        stat = Path(location).stat()
+    except OSError:
+        return None
+    return {"id": "{0}:{1}".format(stat.st_dev, stat.st_ino), "path": str(location), "bytes": stat.st_size}
+
+
+def _folder_files(directory):
+    """Every file in a model folder, hidden ones included: they leave with the folder."""
+    files = []
+    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
+        dirnames.sort()
+        files.extend(item for item in (_stored_file(Path(dirpath) / name) for name in sorted(filenames)) if item)
+    return files
+
+
+def _gguf_items(entries):
+    """GGUF models as storage items: a split model is one item, and the only model in a folder holds its projectors."""
+    sets = {}
+    for entry in entries:
+        location = Path(entry["path"])
+        shard = _SHARD.match(location.stem) if entry.get("shard") else None
+        key = (str(location.parent), shard.group("stem"), shard.group("total")) if shard else (entry["path"],)
+        sets.setdefault(key, []).append(entry)
+    models, companions = [], {}
+    for members in sets.values():
+        members.sort(key=lambda item: (item.get("shard") or {}).get("index", 1))
+        folder = str(Path(members[0]["path"]).parent)
+        if members[0].get("companion"):
+            companions.setdefault(folder, []).extend(members)
+        else:
+            models.append(members)
+    bases = {}
+    for members in models:
+        if members[0].get("draft") is None:
+            bases.setdefault(str(Path(members[0]["path"]).parent), []).append(members)
+    for folder, members in bases.items():
+        if len(members) == 1 and folder in companions:
+            members[0].extend(companions.pop(folder))
+    models.extend([item] for members in companions.values() for item in members)
+    items = []
+    for members in models:
+        first = members[0]
+        items.append({
+            "path": first["path"], "kind": "gguf", "format": "gguf", "name": first["name"],
+            "model_key": first["model_key"], "shape": first.get("shape") if first.get("draft") is None else None,
+            "files": [item for item in (_stored_file(member["path"]) for member in members) if item],
+        })
+    return items
+
+
+def _storage_items(entries, outputs, ollama):
+    items = _gguf_items(entries)
+    for output in outputs:
+        items.append({
+            "path": output["path"], "kind": "folder", "format": output.get("format", "mlx"),
+            "name": _mlx_name(output["path"]), "model_key": _mlx_model_key(output["path"]),
+            "shape": output.get("shape"), "files": _folder_files(output["path"]),
+        })
+    for model in ollama:
+        files = [_stored_file(location) for location in [model["path"]] + model.get("blobs", [])]
+        items.append({
+            "path": model["path"], "kind": "ollama", "format": model["format"], "name": model["name"],
+            "model_key": model["model_key"], "shape": model.get("shape") if model.get("draft") is None else None,
+            "files": [item for item in files if item],
+        })
+    return sorted(items, key=lambda item: item["path"])
+
+
+def _scan_root(path, roots):
+    """The deepest scan root holding ``path``."""
+    matches = [root for root in roots if Path(path).is_relative_to(root)]
+    return max(matches, key=lambda root: len(Path(root).parts)) if matches else str(Path(path).parent)
+
+
+def _store(item):
+    if item["kind"] == "ollama":
+        return "ollama"
+    parts = Path(item["path"]).parts
+    cached = any(parts[index] == "snapshots" and parts[index - 1].startswith("models--") for index in range(1, len(parts)))
+    return "huggingface" if cached else "folder"
+
+
+def _unique_bytes(items):
+    files = {}
+    for item in items:
+        for stored in item["files"]:
+            files.setdefault(stored["id"], stored["bytes"])
+    return sum(files.values())
+
+
+def _root_usage(root, claimed, counted, occupied):
+    """Bytes of every file under a scan root not yet ``counted``, and the bytes that belong to no model.
+
+    Those are grouped by the outermost folder (or file) on their path that holds
+    no model, given the ``occupied`` paths: every model and its parent folders.
+    """
+    base = Path(root)
+    total = 0
+    other = {}
+    for dirpath, _dirnames, filenames in os.walk(base, followlinks=False):
+        for name in filenames:
+            location = Path(dirpath) / name
+            try:
+                stat = location.lstat()
+            except OSError:
+                continue
+            key = "{0}:{1}".format(stat.st_dev, stat.st_ino)
+            if not S_ISREG(stat.st_mode) or key in counted:
+                continue
+            counted.add(key)
+            total += stat.st_size
+            if key in claimed:
+                continue
+            group = base
+            for part in location.relative_to(base).parts:
+                group = group / part
+                if str(group) not in occupied:
+                    break
+            other[str(group)] = other.get(str(group), 0) + stat.st_size
+    return total, other
+
+
+def storage(entries, outputs, ollama, roots, assets=()):
+    """What every model occupies on disk, each file counted once however many models or links reach it.
+
+    An item is a GGUF model (all its shards, plus the projectors beside it when it
+    is the only model in its folder), a model folder, or an Ollama model (its
+    manifest and blobs). ``files`` lists each file's disk identity, so the bytes a
+    removal frees are the files no remaining item still uses. Each file counts once
+    toward ``disk_bytes``, under the first root and store that hold it. Each root
+    also reports ``total_bytes``, every file beneath it, and ``other``: where the
+    bytes that belong to no recognized model sit.
+    """
+    items = sorted(_storage_items(entries, outputs, ollama) + list(assets), key=lambda item: item["path"])
+    claimed = set()
+    by_root = {root: 0 for root in roots}
+    by_store = {}
+    for item in items:
+        item["root"] = _scan_root(item["path"], roots)
+        item["store"] = _store(item)
+        own = {stored["id"]: stored["bytes"] for stored in item["files"]}
+        item["bytes"] = sum(own.values())
+        fresh = sum(size for key, size in own.items() if key not in claimed)
+        claimed.update(own)
+        by_root[item["root"]] = by_root.get(item["root"], 0) + fresh
+        by_store[item["store"]] = by_store.get(item["store"], 0) + fresh
+    occupied = {str(parent) for item in items for parent in [Path(item["path"]), *Path(item["path"]).parents]}
+    counted = set()
+    usage = []
+    for root, size in by_root.items():
+        total, other = _root_usage(root, claimed, counted, occupied)
+        usage.append({
+            "root": root, "bytes": size, "total_bytes": total,
+            "other": [{"path": path, "bytes": value} for path, value in sorted(other.items(), key=lambda pair: (-pair[1], pair[0]))],
+        })
+    return {
+        "disk_bytes": sum(by_root.values()),
+        "roots": usage,
+        "stores": [{"store": store, "bytes": size} for store, size in sorted(by_store.items())],
+        "items": items,
+    }
+
+
+def _display_stem(name):
+    """A model name without its file extension and trailing quantization labels."""
+    stem = name[:-len(GGUF_SUFFIX)] if name.lower().endswith(GGUF_SUFFIX) else name
+    while True:
+        trimmed = _MLX_QUANT_SUFFIX.sub("", stem)
+        if trimmed == stem or not trimmed:
+            return stem
+        stem = trimmed
+
+
+def families(items, task_types=None):
+    """Copies of one model across formats and stores.
+
+    Items share a family when their architecture and size match (:func:`_shape`:
+    fine-tunes and quantizations of one base model), else when their names match
+    without quantization labels. ``task_types`` maps an item path to its task type;
+    embedding and classification models stay apart from generators of the same
+    architecture. ``bytes`` counts each file once.
+    """
+    groups = {}
+    for item in items:
+        task = (task_types or {}).get(item["path"])
+        if item["shape"]:
+            key = "shape:" + item["shape"] + (":" + task if task in _SEPARATE_TASKS else "")
+        else:
+            key = "name:" + item["model_key"]
+        groups.setdefault(key, []).append(item)
+    found = []
+    for key, members in groups.items():
+        name = min((item["kind"] == "ollama", len(_normalize_stem(_display_stem(item["name"]))), _display_stem(item["name"]))
+                   for item in members)[2]
+        found.append({
+            "family_id": key, "name": name, "copies": len(members),
+            "members": sorted(item["path"] for item in members), "bytes": _unique_bytes(members),
+        })
+    return sorted(found, key=lambda family: (-family["bytes"], family["family_id"]))
+
+
+def inventory(gguf_roots, mlx_roots=(), receipts=(), signature=True, limit=MAX_SCAN_FILES, compare_assets=False, asset_exclude_roots=()):
     """One read-only pass: what exists, what is converted, what is redundant."""
     errors = []
     entries = scan_gguf(gguf_roots, signature=signature, limit=limit, errors=errors)
@@ -1102,14 +1377,25 @@ def inventory(gguf_roots, mlx_roots=(), receipts=(), signature=True, limit=MAX_S
     paired = pair_conversions(entries, outputs, receipts)
     duplicates = group_duplicates(paired + _ollama_gguf_entries(ollama)) + group_mlx_duplicates(
         outputs, signature=signature, ollama=ollama)
+    from .standalone_assets import scan as scan_assets
+    all_roots = list(dict.fromkeys([str(Path(root).expanduser()) for root in list(gguf_roots) + list(mlx_roots or gguf_roots)]))
+    assets, asset_duplicates, asset_scan = scan_assets(all_roots, _storage_items(paired, outputs, ollama), limit, compare_assets, asset_exclude_roots)
+    duplicates.extend(asset_duplicates)
     for group in duplicates:
         group["group_id"] = "{0}:{1}".format(group["kind"], group["identity"])
     pending = [item for item in paired if item["status"] == "pending"]
+    roots = {
+        "gguf": [str(Path(root).expanduser()) for root in gguf_roots],
+        "mlx": [str(Path(root).expanduser()) for root in (mlx_roots or gguf_roots)],
+    }
+    stored = storage(paired, outputs, ollama, list(dict.fromkeys(roots["gguf"] + roots["mlx"])), assets)
+    sizes = {item["path"]: item["bytes"] for item in stored["items"]}
+    for output in outputs:
+        output["bytes"] = sizes.get(output["path"], 0)
     return {
-        "roots": {
-            "gguf": [str(Path(root).expanduser()) for root in gguf_roots],
-            "mlx": [str(Path(root).expanduser()) for root in (mlx_roots or gguf_roots)],
-        },
+        "roots": roots,
+        "storage": stored,
+        "asset_scan": asset_scan,
         "models": paired,
         "root_errors": errors,
         "outputs": outputs,
