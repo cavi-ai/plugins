@@ -689,11 +689,12 @@ def _run_wire(arguments):
         ), arguments.json)
 
 
-_BENCH_RUNTIMES = ("ollama", "lmstudio", "mlx_lm", "mlx-vlm", "litellm")
+_BENCH_RUNTIMES = ("ollama", "lmstudio", "mlx_lm", "mlx-vlm", "litellm", "strata", "splash")
 
 
 _BENCH_ORIGINS = {"ollama": "http://127.0.0.1:11434", "lmstudio": "http://127.0.0.1:1234",
-                  "mlx-vlm": "http://127.0.0.1:8083", "mlx_lm": "http://127.0.0.1:8080", "litellm": "http://127.0.0.1:4000"}
+                  "mlx-vlm": "http://127.0.0.1:8083", "mlx_lm": "http://127.0.0.1:8080", "litellm": "http://127.0.0.1:4000",
+                  "strata": "http://127.0.0.1:8084", "splash": "http://127.0.0.1:8086"}
 
 
 def _bench_runtime_client(name, base_url=None):
@@ -929,14 +930,35 @@ def _run_coding_bench(arguments):
 def _add_serve_arguments(parser):
     from .serve import MAX_TOKENS_DEFAULT
     actions = parser.add_subparsers(dest="serve_command", required=True)
+    service = actions.add_parser("protected-service", help="run an authenticated private-worker gateway in the foreground")
+    service.add_argument("--describe", action="store_true")
+    service.add_argument("--model")
+    service.add_argument("--api-key-file")
+    service.add_argument("--port", type=int)
+    service.add_argument("--runtime-executable", default="mlx_lm.server")
+    service.add_argument("--max-tokens", type=int, default=8192)
+    front = actions.add_parser("front-door", help="route one authenticated loopback port to discovered model routes by name")
+    front.add_argument("--port", type=int, required=True)
+    front_key = front.add_mutually_exclusive_group(required=True)
+    front_key.add_argument("--api-key-file")
+    front_key.add_argument("--api-key-sha256")
+    front.add_argument("--receipts-dir", action="append", default=[])
+    private = actions.add_parser("private-worker", help="serve an existing model over a supervisor-owned Unix listener")
+    private.add_argument("--describe", action="store_true", help="report the private transport protocol without starting a model")
+    private.add_argument("--model")
+    private.add_argument("--socket-fd", type=int)
+    private.add_argument("--runtime-executable", default="mlx_lm.server")
     start = actions.add_parser(
         "start",
         help="preview, then confirmation-gated launch of a local MLX server",
     )
     start.add_argument("--repo", default=None, help="publisher/model present in the local Hugging Face cache")
     start.add_argument("--path", default=None, help="local model directory to serve instead of a cache repo id")
-    start.add_argument("--profile", help="saved Strata settings; explicit options override the profile")
-    start.add_argument("--runtime", required=True, choices=["auto", "mlx_lm", "mlx-vlm", "strata"])
+    start.add_argument("--profile", help="saved serving settings; explicit options override the profile")
+    start.add_argument("--runtime", required=True, choices=["auto", "mlx_lm", "mlx-vlm", "strata", "splash", "tasks"])
+    start.add_argument("--splash-draft-model", help="local DFlash2 draft directory (default: the family's draft in the Hugging Face cache)")
+    start.add_argument("--splash-max-memory-gb", type=float, help="Splash Metal memory ceiling in decimal GB (1–1024); it can only lower Splash's own plan")
+    start.add_argument("--splash-max-context", type=int, help="Splash context limit in tokens (512–1010000)")
     decoding = start.add_mutually_exclusive_group()
     decoding.add_argument("--strata-speculation", choices=["on", "off"], help="legacy Strata draft-and-verify switch (default: off)")
     decoding.add_argument("--strata-decoding", choices=["plain", "lookup", "mtp"], help="Strata verified decoding mode; lookup needs no draft weights")
@@ -947,7 +969,10 @@ def _add_serve_arguments(parser):
     start.add_argument("--adapter-path", default=None, help="LoRA adapter directory (mlx_lm only)")
     start.add_argument("--training-receipt", default=None, help="completed LoRA receipt selecting its pinned base and adapter")
     start.add_argument("--thinking", choices=["default", "off"], default="default",
-                       help="off asks the chat template to skip reasoning (mlx_lm); other runtimes report unsupported")
+                       help="off asks the chat template to skip reasoning (mlx_lm, splash); other runtimes report unsupported")
+    start.add_argument('--system-prompt', help='default chat system prompt when the client supplies none (--jit)')
+    start.add_argument('--default-temperature', type=float, help='temperature when the client omits it (--jit, 0–2)')
+    start.add_argument('--default-top-p', type=float, help='top-p when the client omits it (--jit, 0–1)')
     start.add_argument("--m5-prefill", action="store_true",
                        help="opt-in M5 affine Q4 prompt kernel; unsupported hardware/models use native MLX")
     start.add_argument("--prompt-lookup", action="store_true",
@@ -955,6 +980,9 @@ def _add_serve_arguments(parser):
     start.add_argument("--vision-cache", action="store_true",
                        help="opt-in bounded Qwen2.5-VL and Qwen3-VL image feature reuse with MLX-VLM")
     start.add_argument("--jit", action="store_true", help="keep endpoint reachable; load local weights on inference requests")
+    authentication = start.add_mutually_exclusive_group()
+    authentication.add_argument("--api-key-file", help="private API key file for a supervised inference endpoint")
+    authentication.add_argument("--api-key-sha256", help="verification digest for an API key held in a secure credential store")
     _add_memory_arguments(start)
     start.add_argument("--launchd", action="store_true", help="install a launchd agent plist instead of spawning now")
     start.add_argument("--launchd-dir", default=None, help="launchd target directory (defaults to ~/Library/LaunchAgents)")
@@ -975,6 +1003,12 @@ def _add_serve_arguments(parser):
     unload.add_argument("--expected-start", default=None)
     unload.add_argument("--receipts-dir", default=None)
     unload.add_argument("--json", action="store_true")
+    reclaim = actions.add_parser("reclaim-cache", help="release free allocator buffers from an idle resident task worker")
+    reclaim.add_argument("--port", type=int, required=True)
+    reclaim.add_argument("--expected-pid", type=int, required=True)
+    reclaim.add_argument("--expected-start", default=None)
+    reclaim.add_argument("--receipts-dir", default=None)
+    reclaim.add_argument("--json", action="store_true")
     policy = actions.add_parser("policy", help="configure owned JIT memory management without restarting")
     policy.add_argument("--port", type=int, required=True)
     policy.add_argument("--expected-pid", type=int, required=True)
@@ -985,7 +1019,12 @@ def _add_serve_arguments(parser):
     status = actions.add_parser("status", help="cross-check serve receipts against live processes")
     status.add_argument("--receipts-dir", default=None)
     status.add_argument("--json", action="store_true")
-    profiles = actions.add_parser("profile", help="save and reuse local Strata memory and decoding settings")
+    budget = actions.add_parser('budget', help='inspect or configure the shared agent memory budget')
+    budget.add_argument('--limit-gb', type=float)
+    budget.add_argument('--reserve-gb', type=float, default=8)
+    budget.add_argument('--include-pid', type=int, action='append')
+    budget.add_argument('--json', action='store_true')
+    profiles = actions.add_parser("profile", help="save and reuse local memory, residency and execution settings")
     profile_actions = profiles.add_subparsers(dest="profile_command", required=True)
     for command in ("save", "show", "list", "delete"):
         action = profile_actions.add_parser(command)
@@ -994,27 +1033,58 @@ def _add_serve_arguments(parser):
         action.add_argument("--receipts-dir", default=None)
         action.add_argument("--json", action="store_true")
         if command == "save":
-            action.add_argument("--memory-budget-gb", type=float, required=True)
+            action.add_argument("--memory-budget-gb", type=float, default=None)
             action.add_argument("--min-headroom-gb", type=float, required=True)
-            action.add_argument("--strata-context-tokens", type=int, default=16384)
-            action.add_argument("--strata-decoding", choices=["plain", "lookup", "mtp"], default="plain")
+            action.add_argument("--strata-context-tokens", type=int, default=None)
+            action.add_argument("--strata-decoding", choices=["plain", "lookup", "mtp"], default=None)
             action.add_argument("--idle-timeout", type=int, default=300)
             action.add_argument("--keep-loaded", action="store_true")
             action.add_argument("--unload-under-pressure", action=argparse.BooleanOptionalAction, default=True)
+            action.add_argument("--execution-wait", dest="execution_wait_seconds", type=int, default=None)
+            action.add_argument("--release-after-request", action=argparse.BooleanOptionalAction, default=None)
+            _add_allocator_cache_arguments(action)
             action.add_argument("--replace", action="store_true")
+    workflow = actions.add_parser("workflow", help="manage local serving workflows")
+    workflow_actions = workflow.add_subparsers(dest="workflow_command", required=True)
+    for command in ("save", "show", "list", "delete", "preview", "start", "status", "stop", "resolve"):
+        action = workflow_actions.add_parser(command)
+        if command != "list":
+            action.add_argument("--name", required=True)
+        if command == "save":
+            action.add_argument("--file", required=True)
+        if command == "resolve":
+            action.add_argument("--role", required=True)
+        if command == "start":
+            action.add_argument("--confirm", action="store_true", required=True)
+            action.add_argument("--preview-hash", required=True)
+        action.add_argument("--receipts-dir", default=None)
+        action.add_argument("--json", action="store_true")
     discover = actions.add_parser("discover", help="find engine services across registered and live receipt locations")
     discover.add_argument("--receipts-dir", action="append", default=[])
     discover.add_argument("--json", action="store_true")
 
 
+def _add_allocator_cache_arguments(parser):
+    limit = parser.add_mutually_exclusive_group()
+    limit.add_argument('--allocator-cache-limit-mib', type=int, default=None,
+                       help='resident task worker free-buffer cache cap in MiB (0 disables caching)')
+    limit.add_argument('--clear-allocator-cache-limit', action='store_true',
+                       help='restore the worker native default allocator cache limit')
+    parser.add_argument('--cache-reclaim', choices=['off', 'idle', 'pressure'], default=None,
+                        help='reclaim idle resident worker cache; pressure requires --min-headroom-gb')
+
+
 def _add_memory_arguments(parser, clear_budget=False):
+    _add_allocator_cache_arguments(parser)
     budgets = parser.add_mutually_exclusive_group()
     budgets.add_argument("--memory-budget-gb", type=float, default=None,
-                        help="Strata JIT estimated total model-memory allowance in GB; default reserve: 2 GB")
+                        help="Strata model allowance or task job memory cap in GB; default reserve: 2 GB")
     if clear_budget:
         budgets.add_argument("--clear-memory-budget", action="store_true",
                              help="remove the model budget after active requests finish")
     parser.add_argument("--idle-timeout", type=int, default=None, help="unload after this many idle seconds (0 disables)")
+    parser.add_argument("--execution-wait", dest="execution_wait_seconds", type=int, default=None, help="wait up to this many seconds for host compute (0-3600; default 0)")
+    parser.add_argument("--release-after-request", action=argparse.BooleanOptionalAction, default=None, help="release model weights after each completed inference request")
     parser.add_argument("--keep-loaded", action=argparse.BooleanOptionalAction, default=None, help="prevent automatic idle unload after use")
     parser.add_argument("--unload-under-pressure", action=argparse.BooleanOptionalAction, default=None,
                         help="guard loaded requests and unload idle workers below --min-headroom-gb")
@@ -1024,35 +1094,53 @@ def _add_memory_arguments(parser, clear_budget=False):
 
 
 def _memory_arguments(arguments):
-    policy = {"idle_timeout_seconds": arguments.idle_timeout or 0, "keep_loaded": bool(arguments.keep_loaded),
-              "minimum_headroom_gb": arguments.min_headroom_gb}
-    if arguments.memory_budget_gb is not None:
-        policy["model_memory_budget_gb"] = arguments.memory_budget_gb
-    if getattr(arguments, "clear_memory_budget", False):
-        if arguments.memory_budget_gb is not None:
-            raise ValueError("Choose --memory-budget-gb or --clear-memory-budget.")
-        policy["model_memory_budget_gb"] = None
-    if arguments.context_tokens is not None:
-        policy["context_tokens"] = arguments.context_tokens
-    if arguments.unload_under_pressure:
-        policy["unload_under_pressure"] = True
-    return policy
+    from .memory_policy import from_cli
+    return from_cli(arguments)
+
+
+def _start_memory_policy(arguments, runtime):
+    from .memory_policy import for_start
+    return for_start(arguments, runtime)
 
 
 def _run_serve(arguments):
     from .serve import (
-        ServeError, configure_serve_memory, default_model_present, load_recipes, plan_start, resolve_serve_runtime,
+        ServeError, configure_serve_memory, reclaim_serve_cache, default_model_present, load_recipes, plan_start, resolve_serve_runtime,
         start_serve, status_serve, stop_serve, unload_serve, wired_port_claim,
     )
     operation = "serve-{0}".format(arguments.serve_command)
     try:
+        if arguments.serve_command == 'budget':
+            import math
+            from .residency import MemoryRegistry
+            registry = MemoryRegistry()
+            if arguments.limit_gb is None:
+                if arguments.include_pid:
+                    raise ValueError('--include-pid requires --limit-gb.')
+                data = registry.snapshot()
+            else:
+                if any(not math.isfinite(value) for value in (arguments.limit_gb, arguments.reserve_gb)):
+                    raise ValueError('Memory limits must be finite gigabyte values.')
+                data = registry.configure_budget(round(arguments.limit_gb * 1e9),
+                    round(arguments.reserve_gb * 1e9), arguments.include_pid)
+            return _emit_serve_result(ResultEnvelope.ok(operation, data), arguments.json,
+                                      human=json.dumps(data, indent=2))
         if arguments.serve_command == "profile":
             from . import serve_profiles
             command = arguments.profile_command
             if command == "save":
                 keys = ("memory_budget_gb", "min_headroom_gb", "strata_context_tokens", "strata_decoding",
                         "idle_timeout", "keep_loaded", "unload_under_pressure")
-                settings = {key: getattr(arguments, key) for key in keys}
+                settings = {key: getattr(arguments, key) for key in keys if getattr(arguments, key) is not None}
+                strata = any(key in settings for key in ("strata_context_tokens", "strata_decoding"))
+                if strata:
+                    settings.setdefault("strata_context_tokens", 16384)
+                    settings.setdefault("strata_decoding", "plain")
+                for key in ("execution_wait_seconds", "release_after_request", "allocator_cache_limit_mib", "cache_reclaim"):
+                    if getattr(arguments, key) is not None:
+                        settings[key] = getattr(arguments, key)
+                if arguments.clear_allocator_cache_limit:
+                    settings['allocator_cache_limit_mib'] = None
                 result = {"name": arguments.name, "settings": serve_profiles.save_profile(
                     arguments.name, settings, arguments.receipts_dir, replace=arguments.replace)}
             elif command == "show":
@@ -1064,6 +1152,35 @@ def _run_serve(arguments):
                 result = {"name": arguments.name, "deleted": True}
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json,
                                       human=json.dumps(result, indent=2))
+        if arguments.serve_command == "workflow":
+            from . import workflow_sets
+            command = arguments.workflow_command
+            if command in ("start", "status", "stop", "resolve"):
+                from . import workflow_activation
+                if command == "start":
+                    data = workflow_activation.start_workflow(arguments.name, arguments.preview_hash, receipts_dir=arguments.receipts_dir)
+                elif command == "status":
+                    data = workflow_activation.status_workflow(arguments.name, receipts_dir=arguments.receipts_dir)
+                elif command == "resolve":
+                    data = workflow_activation.resolve_workflow_role(arguments.name, arguments.role, receipts_dir=arguments.receipts_dir)
+                else:
+                    data = workflow_activation.stop_workflow(arguments.name, receipts_dir=arguments.receipts_dir)
+            elif command == "save":
+                with open(arguments.file, "rb") as stream:
+                    raw = stream.read(workflow_sets.MAX_BYTES + 1)
+                if len(raw) > workflow_sets.MAX_BYTES:
+                    raise ValueError("Workflow definition is too large.")
+                data = workflow_sets.save_workflow(arguments.name, json.loads(raw), arguments.receipts_dir)
+            elif command == "list":
+                data = {"workflows": workflow_sets.list_workflows(arguments.receipts_dir)}
+            elif command == "delete":
+                workflow_sets.delete_workflow(arguments.name, arguments.receipts_dir)
+                data = {"name": arguments.name, "deleted": True}
+            else:
+                definition = workflow_sets.load_workflow(arguments.name, arguments.receipts_dir)
+                data = workflow_sets.preview_workflow(definition, receipts_dir=arguments.receipts_dir) if command == "preview" else definition
+            return _emit_serve_result(ResultEnvelope.ok(operation, data), arguments.json,
+                                      human=json.dumps(data, indent=2))
         if arguments.serve_command == "discover":
             from .service_registry import discover_services
             data = discover_services(arguments.receipts_dir)
@@ -1090,6 +1207,11 @@ def _run_serve(arguments):
                 {"expected_start": arguments.expected_start} if arguments.expected_start is not None else {}))
             return _emit_serve_result(ResultEnvelope.ok(operation, outcome), arguments.json,
                 human="Model unloaded; endpoint remains reachable on port {}.".format(arguments.port))
+        if arguments.serve_command == 'reclaim-cache':
+            outcome = reclaim_serve_cache(arguments.port, arguments.receipts_dir, arguments.expected_pid,
+                                         expected_start=arguments.expected_start)
+            return _emit_serve_result(ResultEnvelope.ok(operation, outcome), arguments.json,
+                                      human='Allocator cache reclaimed on port {}.'.format(arguments.port))
         if arguments.serve_command == "policy":
             outcome = configure_serve_memory(arguments.port, _memory_arguments(arguments), arguments.receipts_dir, arguments.expected_pid, **(
                 {"expected_start": arguments.expected_start} if arguments.expected_start is not None else {}))
@@ -1100,6 +1222,8 @@ def _run_serve(arguments):
             from .serve_profiles import load_profile
             settings = load_profile(arguments.profile, arguments.receipts_dir)
             for key, value in settings.items():
+                if key == 'allocator_cache_limit_mib' and arguments.clear_allocator_cache_limit:
+                    continue
                 if key == "strata_decoding" and arguments.strata_speculation is not None:
                     continue
                 if key == "memory_budget_gb" and arguments.strata_expert_memory_gb is not None:
@@ -1112,9 +1236,9 @@ def _run_serve(arguments):
         selected_runtime = "mlx_lm" if arguments.training_receipt and arguments.runtime == "auto" else arguments.runtime
         runtime, executable = resolve_serve_runtime(
             arguments.repo, arguments.path, selected_runtime, recipes, hf_cache=arguments.hf_cache)
-        if arguments.profile and runtime != "strata":
-            raise ServeError("invalid_arguments", "Saved serving profiles currently require Strata.",
-                             "Select a prepared Strata model or omit --profile.")
+        if arguments.profile and any(key in settings for key in ("strata_context_tokens", "strata_decoding")) and runtime != "strata":
+            raise ServeError("invalid_arguments", "Profiles with Strata settings require the Strata runtime.",
+                             "Select a prepared Strata model or a profile containing only common settings.")
         if arguments.strata_speculation is not None and runtime != "strata":
             raise ServeError("invalid_arguments", "--strata-speculation requires the Strata runtime.", "Select a prepared local Strata profile.")
         plan = plan_start(
@@ -1127,6 +1251,8 @@ def _run_serve(arguments):
             training_receipt=arguments.training_receipt,
             path=arguments.path,
             jit=arguments.jit,
+            api_key_file=arguments.api_key_file,
+            api_key_sha256=arguments.api_key_sha256,
             receipts_dir=arguments.receipts_dir,
             hf_cache=arguments.hf_cache,
             runtime_executable=executable,
@@ -1134,18 +1260,20 @@ def _run_serve(arguments):
             strata_decoding=arguments.strata_decoding,
             strata_expert_memory_gb=arguments.strata_expert_memory_gb,
             strata_context_tokens=arguments.strata_context_tokens,
-            memory_policy=_memory_arguments(arguments) if (arguments.idle_timeout is not None or arguments.keep_loaded
-                                                           or arguments.min_headroom_gb is not None
-                                                           or arguments.context_tokens is not None
-                                                           or arguments.unload_under_pressure
-                                                           or arguments.memory_budget_gb is not None) else None,
+            memory_policy=_start_memory_policy(arguments, runtime),
             thinking=arguments.thinking,
+            system_prompt=arguments.system_prompt,
+            default_temperature=arguments.default_temperature,
+            default_top_p=arguments.default_top_p,
             m5_prefill=arguments.m5_prefill,
             prompt_lookup=arguments.prompt_lookup,
             vision_cache=arguments.vision_cache,
+            splash_draft_model=arguments.splash_draft_model,
+            splash_max_memory_gb=arguments.splash_max_memory_gb,
+            splash_max_context_tokens=arguments.splash_max_context,
         )
         if arguments.launchd:
-            if arguments.jit:
+            if plan.get("jit"):
                 raise ServeError("invalid_arguments", "JIT endpoints require the supervised serve lifecycle.",
                                  "Use the app's endpoint supervisor instead of --launchd.")
             return _run_serve_launchd(arguments, plan, operation)
@@ -1589,9 +1717,12 @@ def _add_intake_arguments(parser):
     )
     fetch.add_argument("source")
     fetch.add_argument("--file", default=None)
+    fetch.add_argument("--additional-file", action="append", default=[], help="exact companion or shard at the same immutable revision (repeatable)")
     fetch.add_argument("--revision", default=None)
     fetch.add_argument("--hf-cache", default=None)
     fetch.add_argument("--local-dir", default=None)
+    fetch.add_argument("--storage-root", default=None, help="owned source-admission index (defaults to XDG state for immutable managed fetches)")
+    fetch.add_argument("--downloads-dir", default=None, help="reviewed support-file location (inside a managed local destination)")
     fetch.add_argument(
         "--model-type", default=None,
         help="model_type from intake resolve; a ported type downloads only the port's files",
@@ -1666,9 +1797,23 @@ def _run_intake(arguments):
             jobs = status_fetch(arguments.receipts_dir)
             return _emit_serve_result(ResultEnvelope.ok(operation, {"jobs": jobs}), arguments.json)
         if arguments.intake_command == "fetch":
-            plan = plan_fetch(arguments.source, revision=arguments.revision, file=arguments.file,
+            from .fetch_storage import default_root
+            from .source_evidence import immutable_revision
+            storage = arguments.storage_root
+            if arguments.local_dir:
+                from .intake_source import parse_hf_source
+                requested_revision = arguments.revision or parse_hf_source(arguments.source)["revision"]
+                if not immutable_revision(requested_revision):
+                    raise FetchError("immutable_revision_required", "A local model destination requires an immutable resolved commit.",
+                                     "Resolve the source, then pass its resolved_revision through --revision.")
+                if arguments.hf_cache:
+                    raise FetchError("invalid_arguments", "A managed destination cannot copy a shared Hugging Face cache.",
+                                     "Use the existing cache in place, or omit --hf-cache for source-admitted managed storage.")
+                if storage is None:
+                    storage = default_root()
+            plan = plan_fetch(arguments.source, revision=arguments.revision, file=arguments.file, additional_files=arguments.additional_file,
                               hf_cache=arguments.hf_cache, local_dir=arguments.local_dir,
-                              model_type=arguments.model_type)
+                              model_type=arguments.model_type, downloads_dir=arguments.downloads_dir, storage_root=storage)
             outcome = start_fetch(plan, receipts_dir=arguments.receipts_dir,
                                   confirm=arguments.confirm, preview_hash=arguments.preview_hash)
             if outcome["status"] == "preview":
@@ -1789,7 +1934,7 @@ def _run_backend(arguments):
 
 
 def _add_convert_arguments(parser):
-    from .convert import Q_BITS_CHOICES, UNQUANTIZED_BITS
+    from .convert import Q_BITS_CHOICES, FLOAT_BITS
     actions = parser.add_subparsers(dest="convert_command", required=True)
     start = actions.add_parser(
         "start",
@@ -1807,13 +1952,20 @@ def _add_convert_arguments(parser):
         help="model_type from intake resolve; selects a port's own converter when it ships one",
     )
     start.add_argument("--subfolder", default=None, help="checkpoint folder inside the repository (converts from the cache)")
-    start.add_argument("--q-bits", type=int, default=4, choices=Q_BITS_CHOICES + (UNQUANTIZED_BITS,))
+    start.add_argument("--q-bits", type=int, default=4, choices=Q_BITS_CHOICES + FLOAT_BITS)
     start.add_argument("--out", default=None, help="output directory (default <model>-MLX-<bits>bit)")
     start.add_argument("--confirm", action="store_true", help="authorize this reviewed conversion")
     start.add_argument("--preview-hash", help="hash returned by the separately reviewed convert preview")
     start.add_argument("--receipts-dir", default=None)
     start.add_argument("--hf-cache", default=None)
     start.add_argument("--source-path", default=None, help="exact downloaded checkpoint directory for --repo; no second download")
+    start.add_argument("--downloads-dir", default=None, help="exact reviewed support-file directory for --repo")
+    start.add_argument("--projector", help="exact matching local vision projector GGUF")
+    start.add_argument("--require-projector", action="store_true", help="refuse a missing or ambiguous vision projector")
+    start.add_argument("--fetch-receipt", help="completed immutable managed fetch receipt for the primary source")
+    start.add_argument("--dependency-fetch-receipt", action="append", default=[], help="completed managed dependency fetch receipt (repeatable)")
+    start.add_argument("--require-completion", action="store_true", help="record actual worker exit and normalized output provenance")
+    start.add_argument("--attempt-id", default=None, help=argparse.SUPPRESS)
     start.add_argument("--json", action="store_true")
     status = actions.add_parser("status", help="cross-check convert receipts against live processes")
     status.add_argument("--receipts-dir", default=None)
@@ -1836,6 +1988,8 @@ def _add_convert_arguments(parser):
         "--no-signature", action="store_true",
         help="skip content signatures (faster, weaker duplicate detection)",
     )
+    scan.add_argument("--compare-assets", action="store_true", help="compare same-size standalone model files by full SHA-256")
+    scan.add_argument("--asset-exclude-root", action="append", default=[], help="exclude a directory from standalone model-file scanning (repeatable)")
     scan.add_argument("--pending-only", action="store_true", help="list only unconverted models")
     scan.add_argument("--json", action="store_true")
     transcribe = actions.add_parser(
@@ -1876,6 +2030,9 @@ def _add_convert_arguments(parser):
     music.add_argument("--duration", type=float, default=15.0)
     music.add_argument("--steps", type=int, default=30)
     music.add_argument("--seed", type=int, default=42)
+    music.add_argument("--bpm", type=int, help="tempo for ACE-Step models (30..300)")
+    music.add_argument("--time-signature", type=int, help="beats per bar for ACE-Step models: 2, 3, 4 or 6")
+    music.add_argument("--reference", help="absolute audio file whose style ACE-Step models follow")
     music.add_argument("--timeout", type=int, default=3600)
     music.add_argument("--json", action="store_true")
     speak = actions.add_parser(
@@ -1915,6 +2072,14 @@ def _add_convert_arguments(parser):
                            "Pixal3D 1024 or 1536 (default)")
     mesh.add_argument("--guidance", type=float, default=None, help="default: the model's own (TripoSG 7)")
     mesh.add_argument("--max-faces", type=int, default=500000)
+    mesh.add_argument('--denoiser-cache', choices=('off','adaptive'), default='off',
+                      help='adaptive residual forecasting for TripoSG; may change geometry')
+    mesh.add_argument('--cache-memory-mib', type=int, default=256,
+                      help='adaptive feature-memory cap in MiB, 8..4096 (default: 256)')
+    mesh.add_argument("--view", action="append", default=[],
+                      help="TRELLIS.2: another image of the object, conditioning sampler steps in turn; repeatable")
+    mesh.add_argument("--guide", default=None,
+                      help="TRELLIS.2: a GLB whose surface voxels replace the sampled sparse structure")
     mesh.add_argument("--timeout", type=int, default=3600)
     mesh.add_argument("--json", action="store_true")
     video = actions.add_parser(
@@ -1930,6 +2095,10 @@ def _add_convert_arguments(parser):
     video.add_argument("--fps", type=int, default=None, help="playback rate written to the MP4 (default: the model's, 16 for Wan2.1)")
     video.add_argument("--steps", type=int, default=None, help="denoising steps (default: the model's, 50 for Wan2.1)")
     video.add_argument("--seed", type=int, default=42)
+    video.add_argument("--denoiser-cache", choices=("off", "adaptive"), default="off",
+                       help="adaptive residual reuse for Wan2.1 T2V; may change generated frames")
+    video.add_argument("--cache-memory-mib", type=int, default=256,
+                       help="adaptive feature-memory cap in MiB, 8..4096 (default: 256)")
     video.add_argument("--timeout", type=int, default=3600, help="seconds before the backend run is stopped")
     video.add_argument("--json", action="store_true")
 
@@ -1949,6 +2118,18 @@ def _run_convert(arguments):
     from .video import plan_video, run_video
     from .mesh import plan_mesh, run_mesh
     operation = "convert-{0}".format(arguments.convert_command)
+
+    def served_or_local(verb, runner, plan, out):
+        # A typed endpoint that already holds this model runs the job; the model never loads twice.
+        from . import served
+        kind, parameters = served.request(verb, arguments)
+        service = served.endpoint(arguments.path, kind)
+        if service is not None:
+            return served.run(service, kind, parameters, None if out is None else str(Path(out).expanduser()),
+                              arguments.timeout)
+        from .compute import guarded_start
+        return guarded_start(verb, runner, plan, timeout=arguments.timeout)
+
     try:
         if arguments.convert_command == "status":
             entries = status_convert(arguments.receipts_dir)
@@ -1978,24 +2159,22 @@ def _run_convert(arguments):
                 raise ValueError("--timeout must be 1..7200 seconds")
             plan = plan_generate(arguments.path, arguments.prompt, arguments.out, width=arguments.width,
                                  height=arguments.height, steps=arguments.steps, seed=arguments.seed)
-            from .compute import guarded_start
-            result = guarded_start("generate", run_generate, plan, timeout=arguments.timeout)
+            result = served_or_local("generate", run_generate, plan, arguments.out)
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["path"])
         if arguments.convert_command == "music":
             if not 1 <= arguments.timeout <= 14400:
                 raise ValueError("--timeout must be 1..14400 seconds")
             plan = plan_music(arguments.path, arguments.caption, arguments.lyrics, arguments.out,
-                              duration=arguments.duration, steps=arguments.steps, seed=arguments.seed)
-            from .compute import guarded_start
-            result = guarded_start("music", run_music, plan, timeout=arguments.timeout)
+                              duration=arguments.duration, steps=arguments.steps, seed=arguments.seed,
+                              bpm=arguments.bpm, time_signature=arguments.time_signature, reference=arguments.reference)
+            result = served_or_local("music", run_music, plan, arguments.out)
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["path"])
         if arguments.convert_command == "speak":
             if not 1 <= arguments.timeout <= 7200:
                 raise ValueError("--timeout must be 1..7200 seconds")
             plan = plan_speak(arguments.path, arguments.text, arguments.out, voice=arguments.voice,
                               speed=arguments.speed, lang_code=arguments.lang_code)
-            from .compute import guarded_start
-            result = guarded_start("speak", run_speak, plan, timeout=arguments.timeout)
+            result = served_or_local("speak", run_speak, plan, arguments.out)
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["path"])
         if arguments.convert_command == "describe":
             if not 1 <= arguments.timeout <= 7200:
@@ -2003,15 +2182,16 @@ def _run_convert(arguments):
             plan = plan_describe(arguments.path, arguments.prompt, image=arguments.image, video=arguments.video,
                                  max_tokens=arguments.max_tokens, temperature=arguments.temperature,
                                  fps=arguments.fps, max_pixels=arguments.max_pixels)
-            from .compute import guarded_start
-            result = guarded_start("describe", run_describe, plan, timeout=arguments.timeout)
+            result = served_or_local("describe", run_describe, plan, None)
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["text"])
         if arguments.convert_command == "mesh":
             if not 1 <= arguments.timeout <= 14400:
                 raise ValueError("--timeout must be 1..14400 seconds")
             plan = plan_mesh(arguments.path, arguments.image, arguments.out, steps=arguments.steps,
                              seed=arguments.seed, resolution=arguments.resolution, guidance=arguments.guidance,
-                             max_faces=arguments.max_faces)
+                             max_faces=arguments.max_faces, denoiser_cache=arguments.denoiser_cache,
+                             cache_memory_mib=arguments.cache_memory_mib, views=arguments.view,
+                             guide=arguments.guide)
             from .compute import guarded_start
             result = guarded_start("mesh", run_mesh, plan, timeout=arguments.timeout)
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["path"])
@@ -2020,9 +2200,9 @@ def _run_convert(arguments):
                 raise ValueError("--timeout must be 1..14400 seconds")
             plan = plan_video(arguments.path, arguments.prompt, arguments.out, width=arguments.width,
                               height=arguments.height, frames=arguments.frames, fps=arguments.fps,
-                              steps=arguments.steps, seed=arguments.seed)
-            from .compute import guarded_start
-            result = guarded_start("video", run_video, plan, timeout=arguments.timeout)
+                              steps=arguments.steps, seed=arguments.seed,
+                              denoiser_cache=arguments.denoiser_cache, cache_memory_mib=arguments.cache_memory_mib)
+            result = served_or_local("video", run_video, plan, arguments.out)
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["path"])
         if arguments.convert_command == "scan":
             report = _convert_scan(arguments)
@@ -2040,13 +2220,19 @@ def _run_convert(arguments):
                     "Drop --backend when converting a GGUF file.",
                 )
             plan = plan_gguf_convert(
-                arguments.gguf, q_bits=arguments.q_bits, out=arguments.out
+                arguments.gguf, q_bits=arguments.q_bits, out=arguments.out, projector=arguments.projector,
+                require_projector=arguments.require_projector, fetch_receipt=arguments.fetch_receipt,
+                dependency_fetch_receipts=arguments.dependency_fetch_receipt, require_completion=arguments.require_completion,
             )
         else:
             plan = plan_convert(arguments.repo, q_bits=arguments.q_bits, out=arguments.out,
                                 backend=arguments.backend, model_type=arguments.model_type,
                                 subfolder=arguments.subfolder, hf_cache=arguments.hf_cache,
-                                source_path=arguments.source_path)
+                                source_path=arguments.source_path, fetch_receipt=arguments.fetch_receipt, downloads_dir=arguments.downloads_dir,
+                                dependency_fetch_receipts=arguments.dependency_fetch_receipt,
+                                require_completion=arguments.require_completion)
+            if arguments.projector or arguments.require_projector:
+                raise ConvertError("invalid_arguments", "Projector selection is only valid with --gguf.", "Use the GGUF conversion source.")
         if not arguments.confirm:
             result = ResultEnvelope.ok(
                 operation, {"plan": plan, "requires_confirmation": True}
@@ -2067,6 +2253,7 @@ def _run_convert(arguments):
             receipts_dir=arguments.receipts_dir,
             confirm=True,
             preview_hash=arguments.preview_hash,
+            attempt_id=arguments.attempt_id,
             model_present=None if arguments.gguf else default_model_present(arguments.hf_cache),
         )
         receipt = outcome["receipt"]
@@ -2099,7 +2286,7 @@ def _run_convert(arguments):
 
 def _convert_scan(arguments):
     from .convert import ConvertError, load_receipts
-    from .gguf import MAX_SCAN_FILES, default_gguf_roots, inventory
+    from .gguf import MAX_SCAN_FILES, default_gguf_roots, families, inventory
     from .taxonomy import annotate_inventory
     roots = arguments.gguf_roots if arguments.gguf_roots is not None else (
         [] if arguments.mlx_roots is not None else default_gguf_roots())
@@ -2115,12 +2302,20 @@ def _convert_scan(arguments):
         receipts=load_receipts(arguments.receipts_dir),
         signature=not arguments.no_signature,
         limit=arguments.limit or MAX_SCAN_FILES,
+        compare_assets=arguments.compare_assets,
+        asset_exclude_roots=arguments.asset_exclude_root,
     )
     if arguments.pending_only:
         report = dict(report, models=[
             item for item in report["models"] if item["status"] == "pending"
         ])
-    return annotate_inventory(report)
+    from .splash_runtime import annotate_support
+    report = annotate_inventory(report)
+    annotate_support(report["outputs"])
+    task_types = {item["path"]: item["task"].get("type") for item in report["models"] + report["outputs"]
+                  if isinstance(item.get("task"), dict)}
+    report["families"] = families(report["storage"]["items"], task_types)
+    return report
 
 
 def _human_bytes(count):
@@ -2162,7 +2357,8 @@ def _convert_scan_human(report, pending_only=False):
         ))
         for group in duplicates:
             if group["kind"] == "exact":
-                lines.append("  same model and quantization, keep {0}".format(group["keep"]))
+                description = "identical model files" if group.get("verification") == "full_sha256" else "same model and quantization"
+                lines.append("  {0}, keep {1}".format(description, group["keep"]))
                 for path in group["redundant"]:
                     lines.append("    redundant: {0}".format(path))
             else:
@@ -2738,6 +2934,27 @@ def build_parser(command=None):
 
 def main(argv=None):
     raw = list(sys.argv[1:] if argv is None else argv)
+    if raw[:2] == ["serve", "protected-service"]:
+        from .protected_service import main as service_main
+        try:
+            return service_main(raw[2:])
+        except (OSError, ValueError, ImportError, RuntimeError):
+            print("Protected MLX service unavailable; verify its runtime, private key and local model.", file=sys.stderr)
+            return 1
+    if raw[:2] == ["serve", "front-door"]:
+        from .front_door import main as front_main
+        try:
+            return front_main(raw[2:])
+        except (OSError, ValueError):
+            print("MLX front door unavailable; verify its port and private key.", file=sys.stderr)
+            return 1
+    if raw[:2] == ["serve", "private-worker"]:
+        from .private_serve import main as private_main
+        try:
+            return private_main(raw[2:])
+        except (OSError, ValueError, ImportError):
+            print("Private MLX worker unavailable; verify the installed runtime and local model.", file=sys.stderr)
+            return 1
     if raw and raw[0] == "lab":
         from .lab import run
         return run(raw[1:])

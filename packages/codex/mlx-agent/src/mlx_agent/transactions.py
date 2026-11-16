@@ -384,7 +384,8 @@ def _read_legacy_migration_state(lock_root):
             return {"version": LEGACY_LOCK_MIGRATION, "targets": {}, "parents": {}, "unscoped": False}
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise ValueError("legacy lock migration marker is not a regular file")
-        value = json.loads(os.read(descriptor, 1048576).decode("utf-8"))
+        with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as source:
+            value = json.load(source)
         # The prior release-candidate marker had no target map. Treat it as
         # an unscoped barrier: it cannot prove which physical parents migrated.
         if value == {"version": LEGACY_LOCK_MIGRATION}:
@@ -864,7 +865,13 @@ class Receipt:
         validations_redacted = False
         if isinstance(value["validations"], dict):
             try:
-                validations_redacted = json.loads(redact_secrets(json.dumps(value["validations"]))) == value["validations"]
+                # Declared target paths are labels, not credential field names.
+                # Check their values and all other validation metadata for secrets.
+                probe = {
+                    "artifacts": [{"path": name, "result": checks} for name, checks in value["validations"].items() if name in targets],
+                    "metadata": {name: checks for name, checks in value["validations"].items() if name not in targets},
+                }
+                validations_redacted = json.loads(redact_secrets(json.dumps(probe))) == probe
             except (TypeError, ValueError, json.JSONDecodeError):
                 validations_redacted = False
         if not isinstance(value["validations"], dict) or not validations_redacted or not isinstance(value["preview"], str) or len(value["preview"]) > MAX_PREVIEW_CHARS + 32 or redact_secrets(value["preview"]) != value["preview"] or not isinstance(value["preview_hash"], str) or not _HASH.fullmatch(value["preview_hash"]):

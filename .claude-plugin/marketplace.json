@@ -13,8 +13,8 @@
       "source": {
         "source": "github",
         "repo": "cavi-ai/mlx-agent",
-        "ref": "v0.12.0",
-        "sha": "fc585f36abdd9d47614327afec4719fa9049d729"
+        "ref": "v0.13.0",
+        "sha": "96995d85ba0ae369dbf1d6c1c570ab012a1bbbec"
       },
       "description": "Discover, verify, and wire local MLX-optimized models on Apple Silicon."
     },

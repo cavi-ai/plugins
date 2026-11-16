@@ -6,6 +6,11 @@ import json
 import sys
 import time
 
+if __package__:
+    from .runner_model_cache import load_model, enabled
+else:
+    from runner_model_cache import load_model, enabled
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -19,15 +24,20 @@ def main(argv=None):
     parser.add_argument("--fps", type=int, required=True)
     parser.add_argument("--steps", type=int, required=True)
     parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--denoiser-cache", choices=("off", "adaptive"), default="off")
+    parser.add_argument("--cache-memory-mib", type=int, default=256)
     arguments = parser.parse_args(argv)
 
     port = importlib.import_module(arguments.module)
     started = time.time()
-    model = port.load(arguments.model)
+    model = load_model(port.load, arguments.model)
+    model.retain_weights = enabled()
     open_seconds = time.time() - started
     result = port.generate(
         model, arguments.prompt, arguments.out, width=arguments.width, height=arguments.height,
         frames=arguments.frames, fps=arguments.fps, steps=arguments.steps, seed=arguments.seed,
+        **({"denoiser_cache": arguments.denoiser_cache, "cache_memory_mib": arguments.cache_memory_mib}
+           if arguments.denoiser_cache != "off" else {}),
     )
     result["load_seconds"] = round(float(result.get("load_seconds", 0.0)) + open_seconds, 3)
     print(json.dumps(result), flush=True)
