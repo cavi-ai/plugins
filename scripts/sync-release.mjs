@@ -65,9 +65,13 @@ export async function syncRelease({ root, name, source, tag, commit }) {
 
   const releases = await readJson(path.join(root, RELEASES));
   const pinned = Object.fromEntries(CANONICAL.filter((plugin) => plugin === name || Object.hasOwn(releases, plugin)).map((plugin) => [plugin, plugin === name ? release : releases[plugin]]));
+  const catalog = await readJson(path.join(root, "catalog.json"));
+  const canonical = catalog.plugins.find((plugin) => plugin.name === name);
+  const updateRevision = Boolean(canonical?.revision && canonical.revision !== commit);
+  if (updateRevision) canonical.revision = commit;
   const hosts = [];
   const claude = await readJson(path.join(root, CLAUDE_MARKETPLACE));
-  for (const entry of claude.plugins) if (entry.name === name) { entry.source = claudeSource(name, release); hosts.push("claude"); }
+  for (const entry of claude.plugins) if (entry.name === name) { entry.source = claudeSource(name, release, canonical); hosts.push("claude"); }
   const discovery = {};
   for (const host of DISCOVERY_HOSTS) {
     discovery[host] = await readJson(path.join(root, `providers/${host}/catalog.json`));
@@ -79,6 +83,7 @@ export async function syncRelease({ root, name, source, tag, commit }) {
   }
   const staged = CODEX_PACKAGES[name] ? await stageCodexPackage({ root, name, source, commit }) : null;
   try {
+    if (updateRevision) await writeJson(path.join(root, "catalog.json"), catalog);
     await writeJson(path.join(root, RELEASES), pinned);
     await writeJson(path.join(root, CLAUDE_MARKETPLACE), claude);
     for (const host of DISCOVERY_HOSTS) await writeJson(path.join(root, `providers/${host}/catalog.json`), discovery[host]);

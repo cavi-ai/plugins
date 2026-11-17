@@ -8,13 +8,15 @@
 | --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | [`mlx-agent`](https://github.com/cavi-ai/mlx-agent) — discover, verify, and wire local MLX models | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | [`obsidian-agent`](https://github.com/cavi-ai/obsidian-agent) — portable vault workflows over the official Obsidian CLI | ✓ | ✓ | — | ✓ | — | — | ✓ |
+| [`agent-sessions`](https://github.com/cavi-ai/agent-sessions) — coordinate focused workers and queued handoffs | ✓ | ✓ | — | — | — | — | — |
+| [`secure-agent`](https://github.com/cavi-ai/secure-agent) — connect Claude activity and guard hooks | ✓ | — | — | — | — | — | — |
 | [`loop-killer`](https://github.com/cavi-ai/loop-killer) — end stop-hook re-prompt loops by clearing the active goal | ✓ | — | — | — | — | — | — |
 
 The machine-readable source of truth is [`catalog.json`](catalog.json). Claude and Codex consume native marketplace projections. Agy, OpenCode, OpenClaw, and Hermes use the discovery records under `providers/`, which link to each source repository's tested installer; those files do not claim a native marketplace protocol. Portable AgentSkills packages remain available from each plugin repository.
 
 ## Releases
 
-[`releases.json`](releases.json) pins each released plugin to one tag and commit, and every host installs that release: the Claude marketplace source carries the tag as `ref` and the commit as `sha`, each discovery install command clones the tag, and the Codex package is copied from it. `loop-killer` has no release yet, so its Claude source follows the default branch.
+[`releases.json`](releases.json) pins each released plugin to one tag and commit, and every host installs that release: root-source Claude entries carry the tag as `ref` and commit as `sha`; the Secure Agent subdirectory uses its pinned commit. Discovery commands clone the tag, and Codex packages are copied from their source. `loop-killer` has no release yet, so its Claude source follows the default branch. Agent Sessions and Secure Agent use the exact source revisions in `catalog.json` until a release is pinned.
 
 A plugin's release workflow sends a `cavi-oss-release` dispatch. [Sync plugin release](.github/workflows/sync-plugin-release.yml) checks out the tag, confirms it resolves to the released commit, points every host at it with `scripts/sync-release.mjs`, runs the catalog gate, opens a pull request and merges it. A sync branch left open is merged on the next run for that release. The same workflow runs by hand from the Actions tab with a plugin name and tag. Locally:
 
@@ -32,19 +34,24 @@ Add the marketplace, then install a plugin:
 /plugin install mlx-agent@cavi-ai
 /plugin install obsidian-agent@cavi-ai
 /plugin install loop-killer@cavi-ai
+/plugin install agent-sessions@cavi-ai
+/plugin install secure-agent@cavi-ai
 ```
 
 ## Codex
 
-Add the marketplace, then install either plugin:
+Add the marketplace, then install a plugin:
 
 ```sh
 codex plugin marketplace add cavi-ai/plugins
 codex plugin add mlx-agent@cavi-ai
 codex plugin add obsidian-agent@cavi-ai
+codex plugin add agent-sessions@cavi-ai
 ```
 
-The Codex projection at [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json) uses Codex's documented marketplace-local source layout, so `packages/codex/` holds a self-contained copy of each release's Codex package. These copies are distribution artifacts, not independent workflow sources; product development remains in the linked plugin repository. `packages/codex/expected-integrity.json` pins each copy's release commit, tree hash and skill inventory, `provenance.json` inside the package must agree with it, and validation rejects local drift.
+Agent Sessions requires its [CLI installed separately](https://github.com/cavi-ai/agent-sessions#get-started); configuring host hooks is a separate, user-directed action. See [Secure Agent setup](https://github.com/cavi-ai/secure-agent#get-started) for its app and guard configuration.
+
+The Codex projection at [`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json) uses Codex's documented marketplace-local source layout, so `packages/codex/` holds a self-contained copy of each release's Codex package. These copies are distribution artifacts, not independent workflow sources; product development remains in the linked plugin repository. `packages/codex/expected-integrity.json` pins each copy's source commit, tree hash and skill inventory, `provenance.json` inside the package must agree with it, and validation rejects local drift.
 
 ## Agy
 
@@ -96,4 +103,4 @@ node --test
 node scripts/validate-catalog.mjs
 ```
 
-Validation rejects identity drift, unknown hosts, packages for undeclared hosts, duplicate entries, non-plugin products, projections that disagree with the canonical host list, repository, or package path, and any host projection that does not install the plugin's pinned release.
+Validation rejects identity drift, unknown hosts, packages for undeclared hosts, duplicate entries, non-plugin products, projections that disagree with the canonical host list, repository, or package path, and any host projection that does not install the plugin's pinned release or source revision.

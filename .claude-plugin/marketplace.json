@@ -35,6 +35,25 @@
         "repo": "cavi-ai/loop-killer"
       },
       "description": "Ends a stop-hook re-prompt loop: after repeated re-prompt turns with no tool work, it clears the active goal and says so."
+    },
+    {
+      "name": "agent-sessions",
+      "source": {
+        "source": "github",
+        "repo": "cavi-ai/agent-sessions",
+        "sha": "c5c56e399db2a5b04f0bc2598c884d94ff77540f"
+      },
+      "description": "Coordinate specialized agent workers with focused context and queued handoffs."
+    },
+    {
+      "name": "secure-agent",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/cavi-ai/secure-agent.git",
+        "path": "plugin",
+        "sha": "ddb1e0e4f2d5098ab62c1cf56c0ec7bd107739d1"
+      },
+      "description": "Connect Claude Code activity and configured guard hooks to Secure Agent."
     }
   ]
 }
