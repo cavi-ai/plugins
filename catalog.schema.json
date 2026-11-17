@@ -27,7 +27,8 @@
       "additionalProperties": false,
       "required": ["name", "repository", "license", "summary", "hosts", "packages"],
       "properties": {
-        "name": { "enum": ["mlx-agent", "obsidian-agent", "loop-killer"] },
+        "name": { "enum": ["mlx-agent", "obsidian-agent", "loop-killer", "agent-sessions", "secure-agent"] },
+        "revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
         "repository": { "type": "string", "pattern": "^cavi-ai/[a-z0-9-]+$" },
         "license": { "type": "string", "minLength": 1 },
         "summary": { "type": "string", "minLength": 1 },

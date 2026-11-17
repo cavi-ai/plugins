@@ -45,7 +45,9 @@ async function mlxAgentSource(skills = ["mlx-adopt", "mlx-scout"]) {
 test("points every host of a released plugin at its tag and commit", async () => {
   const root = await catalogCopy();
   await writeFile(path.join(root, "packages/codex/mlx-agent/stale.txt"), "stale\n");
+  const catalogBefore = await readFile(path.join(root, "catalog.json"), "utf8");
   const result = await syncRelease({ root, name: "mlx-agent", source: await mlxAgentSource(), tag, commit });
+  assert.equal(await readFile(path.join(root, "catalog.json"), "utf8"), catalogBefore);
   assert.deepEqual(result.hosts, ["agy", "claude", "codex", "hermes", "openclaw", "opencode"]);
   assert.deepEqual(await validateCatalog(root), []);
 
@@ -102,4 +104,40 @@ test("refuses bad input before writing anything", async () => {
   assert.deepEqual(await Promise.all(files.map((file) => readFile(path.join(root, file), "utf8"))), before);
   assert.deepEqual(await validateCatalog(root), []);
   assert.deepEqual((await readdir(path.join(root, "packages/codex"))).filter((item) => item.startsWith(".")), []);
+});
+
+test("syncs revision-pinned Agent Sessions into a released package", async () => {
+  const root = await catalogCopy();
+  const source = await mkdtemp(path.join(tmpdir(), "agent-sessions-source-"));
+  await cp(path.join(root, "packages/codex/agent-sessions/.codex-plugin"), path.join(source, ".codex-plugin"), { recursive: true });
+  await cp(path.join(root, "packages/codex/agent-sessions/skills"), path.join(source, "skills"), { recursive: true });
+  const result = await syncRelease({ root, name: "agent-sessions", source, tag, commit });
+  assert.deepEqual(result.hosts, ["claude", "codex"]);
+  assert.equal((await readJson(root, "catalog.json")).plugins.find((p) => p.name === "agent-sessions").revision, commit);
+  assert.deepEqual((await readJson(root, ".claude-plugin/marketplace.json")).plugins.find((p) => p.name === "agent-sessions").source, { source: "github", repo: "cavi-ai/agent-sessions", ref: tag, sha: commit });
+  assert.equal((await readJson(root, "packages/codex/expected-integrity.json"))["agent-sessions"].source_commit, commit);
+  assert.deepEqual(await validateCatalog(root), []);
+});
+
+test("rejects source revision and git-subdirectory drift", async () => {
+  const root = await catalogCopy();
+  const catalog = await readJson(root, "catalog.json");
+  catalog.plugins.find((p) => p.name === "agent-sessions").revision = "a".repeat(40);
+  await writeFile(path.join(root, "catalog.json"), JSON.stringify(catalog));
+  const claude = await readJson(root, ".claude-plugin/marketplace.json");
+  claude.plugins.find((p) => p.name === "secure-agent").source.path = ".";
+  await writeFile(path.join(root, ".claude-plugin/marketplace.json"), JSON.stringify(claude));
+  const errors = await validateCatalog(root);
+  assert(errors.includes("codex package does not match its release pin: agent-sessions"));
+  assert(errors.includes("claude source does not match its release pin: agent-sessions"));
+  assert(errors.includes("claude source does not match its release pin: secure-agent"));
+});
+
+ test("rejects malformed Agent Sessions trusted integrity", async () => {
+  const root = await catalogCopy();
+  const registry = await readJson(root, "packages/codex/expected-integrity.json");
+  registry["agent-sessions"].skills = ["invalid skill"];
+  await writeFile(path.join(root, "packages/codex/expected-integrity.json"), JSON.stringify(registry));
+  const errors = await validateCatalog(root);
+  assert(errors.includes("trusted integrity agent-sessions skills must be sorted unique skill names"));
 });

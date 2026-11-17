@@ -8,7 +8,7 @@ export const HOSTS = ["claude", "codex", "agy", "opencode", "openclaw", "hermes"
 // Marketplace identity: what users type after @ in `plugin install <name>@<marketplace>`.
 export const MARKETPLACE = "cavi-ai";
 // Every plugin the catalog may list. REQUIRED is the subset that must be present and ships a pinned Codex package.
-export const CANONICAL = ["mlx-agent", "obsidian-agent", "loop-killer"];
+export const CANONICAL = ["mlx-agent", "obsidian-agent", "loop-killer", "agent-sessions", "secure-agent"];
 const REQUIRED = ["mlx-agent", "obsidian-agent"];
 // releases.json pins a released plugin to one tag and commit; every host projection of that plugin installs it.
 export const RELEASES = "releases.json";
@@ -20,7 +20,8 @@ export const CODEX_PACKAGES = {
     excluded: ["scripts/mlx-agent-mcp", "src/mlx_agent/mcp_server.py"],
     exclusionReason: "Codex skills use the packaged CLI entrypoint; MCP transport artifacts are not required or distributed by this catalog."
   },
-  "obsidian-agent": { sourcePath: ".", included: [".codex-plugin", "skills"] }
+  "obsidian-agent": { sourcePath: ".", included: [".codex-plugin", "skills"] },
+  "agent-sessions": { sourcePath: ".", included: [".codex-plugin", "skills"] }
 };
 // The install step each discovery host runs inside a fresh clone of the plugin repository.
 const DISCOVERY_INSTALLS = {
@@ -47,8 +48,10 @@ export function discoveryInstallCommand(host, name, release) {
   return `${clone} https://github.com/cavi-ai/${name}.git && ${install}`;
 }
 
-export function claudeSource(name, release) {
-  return release ? { source: "github", repo: `cavi-ai/${name}`, ref: release.tag, sha: release.commit } : { source: "github", repo: `cavi-ai/${name}` };
+export function claudeSource(name, release, canonical) {
+  const sha = release?.commit ?? canonical?.revision;
+  if (canonical?.packages?.claude?.path === "plugin") return { source: "git-subdir", url: `https://github.com/cavi-ai/${name}.git`, path: "plugin", sha };
+  return release ? { source: "github", repo: `cavi-ai/${name}`, ref: release.tag, sha: release.commit } : { source: "github", repo: `cavi-ai/${name}`, ...(sha ? { sha } : {}) };
 }
 const LEGACY = new Set(["claude-plugins", "claude-obsidian", "claude-obsidian-plugin"]);
 const PROJECTIONS = {
@@ -73,7 +76,7 @@ async function json(root, relative, errors) {
 function projectionIdentity(entry) {
   return {
     name: entry?.name,
-    repository: entry?.repository ?? entry?.source?.repo,
+    repository: entry?.repository ?? entry?.source?.repo ?? (entry?.source?.source === "git-subdir" ? entry.source.url?.replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "") : undefined),
     package: entry?.package ?? entry?.source?.path ?? "."
   };
 }
@@ -124,8 +127,10 @@ function validateCanonicalSchema(schema, catalog, errors) {
   for (const [index, plugin] of (Array.isArray(catalog.plugins) ? catalog.plugins : []).entries()) {
     const location = `plugins[${index}]`;
     if (!plugin || typeof plugin !== "object" || Array.isArray(plugin)) { violation(location, "must be an object"); continue; }
-    for (const key of unknownKeys(plugin, ["name", "repository", "license", "summary", "hosts", "packages"])) errors.push(`catalog plugin ${plugin?.name} unknown property: ${key}`);
+    for (const key of unknownKeys(plugin, ["name", "repository", "license", "summary", "hosts", "packages", "revision"])) errors.push(`catalog plugin ${plugin?.name} unknown property: ${key}`);
     for (const key of ["name", "repository", "license", "summary", "hosts", "packages"]) if (!Object.hasOwn(plugin, key)) violation(`${location}.${key}`, "is required");
+    if (Object.hasOwn(plugin, "revision") && (! ["agent-sessions", "secure-agent"].includes(plugin.name) || !/^[0-9a-f]{40}$/.test(plugin.revision))) violation(`${location}.revision`, "must be a full lowercase SHA for a revision-pinned plugin");
+    if (["agent-sessions", "secure-agent"].includes(plugin.name) && !/^[0-9a-f]{40}$/.test(plugin.revision ?? "")) violation(`${location}.revision`, "is required for a revision-pinned plugin");
     if (Object.hasOwn(plugin, "name") && !CANONICAL.includes(plugin.name)) violation(`${location}.name`, "must be a canonical plugin name");
     if (Object.hasOwn(plugin, "repository") && (typeof plugin.repository !== "string" || !/^cavi-ai\/[a-z0-9-]+$/.test(plugin.repository))) violation(`${location}.repository`, "must match ^cavi-ai/[a-z0-9-]+$");
     for (const key of ["license", "summary"]) if (Object.hasOwn(plugin, key) && (typeof plugin[key] !== "string" || plugin[key].length < 1)) violation(`${location}.${key}`, "must be a non-empty string");
@@ -158,9 +163,9 @@ function validateTrustedIntegrity(registry, errors) {
     errors.push("trusted integrity registry must be an object");
     return;
   }
-  for (const name of Object.keys(registry)) if (!REQUIRED.includes(name)) errors.push(`trusted integrity registry unexpected package: ${name}`);
-  for (const name of REQUIRED) {
-    if (!Object.hasOwn(registry, name)) { errors.push(`trusted integrity registry missing package: ${name}`); continue; }
+  for (const name of Object.keys(registry)) if (!Object.hasOwn(CODEX_PACKAGES, name)) errors.push(`trusted integrity registry unexpected package: ${name}`);
+  for (const name of REQUIRED) if (!Object.hasOwn(registry, name)) errors.push(`trusted integrity registry missing package: ${name}`);
+  for (const name of Object.keys(registry).filter((item) => Object.hasOwn(CODEX_PACKAGES, item))) {
     const record = registry[name];
     if (!record || typeof record !== "object" || Array.isArray(record)) { errors.push(`trusted integrity ${name} must be an object`); continue; }
     for (const key of unknownKeys(record, ["repository", "source_commit", "source_path", "tree", "skills"])) errors.push(`trusted integrity ${name} unexpected property: ${key}`);
@@ -187,7 +192,7 @@ function validateReleases(releases, errors) {
   }
 }
 
-function validateNativeProjection(host, projection, releases, errors) {
+function validateNativeProjection(host, projection, releases, byName, errors) {
   const rootAllowed = host === "claude" ? ["name", "owner", "metadata", "plugins"] : ["name", "interface", "plugins"];
   for (const key of unknownKeys(projection, rootAllowed)) errors.push(`${host} native root property invalid: ${key}`);
   if (host === "claude") {
@@ -196,8 +201,9 @@ function validateNativeProjection(host, projection, releases, errors) {
   } else if (typeof projection?.interface?.displayName !== "string" || unknownKeys(projection?.interface, ["displayName"]).length) errors.push("codex native interface invalid");
   for (const entry of projection.plugins ?? []) {
     if (host === "claude") {
-      if (unknownKeys(entry, ["name", "source", "description"]).length || entry?.source?.source !== "github" || typeof entry?.source?.repo !== "string" || unknownKeys(entry.source, ["source", "repo", "ref", "sha"]).length) errors.push(`claude native source invalid: ${entry?.name}`);
-      else if (JSON.stringify(entry.source) !== JSON.stringify(claudeSource(entry.name, releases?.[entry.name]))) errors.push(`claude source does not match its release pin: ${entry?.name}`);
+      const expected = claudeSource(entry?.name, releases?.[entry?.name], byName.get(entry?.name));
+      if (unknownKeys(entry, ["name", "source", "description"]).length || !entry?.source || !["github", "git-subdir"].includes(entry.source.source)) errors.push(`claude native source invalid: ${entry?.name}`);
+      else if (JSON.stringify(entry.source) !== JSON.stringify(expected)) errors.push(`claude source does not match its release pin: ${entry?.name}`);
     } else {
       if (unknownKeys(entry, ["name", "source", "policy", "category"]).length || entry?.source?.source !== "local" || typeof entry?.source?.path !== "string" || unknownKeys(entry.source, ["source", "path"]).length) errors.push(`codex native source invalid: ${entry?.name}`);
       if (entry?.policy?.installation !== "AVAILABLE" || entry?.policy?.authentication !== "ON_INSTALL" || unknownKeys(entry?.policy, ["installation", "authentication"]).length) errors.push(`codex native policy invalid: ${entry?.name}`);
@@ -211,7 +217,7 @@ async function validateCodexPackage(root, raw, canonical, trustedIntegrity, rele
     errors.push(`codex source must be marketplace-local: ${raw?.name}`);
     return;
   }
-  if (trustedIntegrity && trustedIntegrity.source_commit !== release?.commit) errors.push(`codex package does not match its release pin: ${raw.name}`);
+  if (trustedIntegrity && trustedIntegrity.source_commit !== (release?.commit ?? canonical.revision)) errors.push(`codex package does not match its release pin: ${raw.name}`);
   const codexPath = canonical.packages?.codex?.path;
   if (typeof codexPath !== "string" || !codexPath) {
     errors.push(`codex package path invalid: ${raw?.name}`);
@@ -304,6 +310,7 @@ export async function validateCatalog(root = process.cwd()) {
     if (typeof plugin.repository !== "string" || !plugin.repository) errors.push(`${prefix} repository is required`);
     else if (plugin.name && plugin.repository !== `cavi-ai/${plugin.name}`) errors.push(`repository identity mismatch: ${plugin.name}`);
     if (typeof plugin.summary !== "string" || !plugin.summary) errors.push(`${prefix} summary is required`);
+    if (releases?.[plugin.name] && plugin.revision && releases[plugin.name].commit !== plugin.revision) errors.push(`catalog revision does not match its release pin: ${plugin.name}`);
     if (typeof plugin.license !== "string" || !plugin.license) errors.push(`${prefix} license is required`);
     if (!Array.isArray(plugin.hosts)) errors.push(`${prefix} hosts must be an array`);
     else {
@@ -326,7 +333,7 @@ export async function validateCatalog(root = process.cwd()) {
     if (projection === JSON_FAILURE) continue;
     if (!projection || typeof projection !== "object" || Array.isArray(projection)) { errors.push(`${host} projection must be an object`); continue; }
     if (projection.name !== MARKETPLACE) errors.push(`${host} projection name must be ${MARKETPLACE}`);
-    if (host === "claude" || host === "codex") validateNativeProjection(host, projection, releases, errors);
+    if (host === "claude" || host === "codex") validateNativeProjection(host, projection, releases, byName, errors);
     if (DISCOVERY_HOSTS.includes(host)) {
       if (projection.host !== host) errors.push(`${host} projection host mismatch`);
       if (projection.protocol !== "discovery") errors.push(`${host} projection must use discovery protocol`);
@@ -350,6 +357,7 @@ export async function validateCatalog(root = process.cwd()) {
         continue;
       }
       if (host === "codex" && raw?.source) {
+        if (!trustedRegistry?.[raw.name]) errors.push(`trusted integrity registry missing package: ${raw.name}`);
         await validateCodexPackage(root, raw, canonical, trustedRegistry?.[raw.name], releases?.[raw.name], errors);
         entry.repository = canonical.repository;
         entry.package = raw.source.path?.replace(/^\.\//, "");

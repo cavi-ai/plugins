@@ -1,0 +1,13 @@
+{
+  "repository": "cavi-ai/agent-sessions",
+  "source_commit": "c5c56e399db2a5b04f0bc2598c884d94ff77540f",
+  "source_path": ".",
+  "included": [
+    ".codex-plugin",
+    "skills"
+  ],
+  "integrity": {
+    "algorithm": "sha256",
+    "tree": "1d6d18db3d64cafb15fa6f310d55bde6f76c51525e9013ee95e071da3bb0fe05"
+  }
+}
