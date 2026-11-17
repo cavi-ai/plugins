@@ -9,7 +9,7 @@ on:
         description: Catalog plugin that released
         required: true
         type: choice
-        options: [mlx-agent, obsidian-agent, loop-killer]
+        options: [mlx-agent, obsidian-agent, loop-killer, agent-sessions, secure-agent]
       tag:
         description: Release tag, for example v0.10.0
         required: true
@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   sync:
-    if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["mlx-agent","obsidian-agent","loop-killer"]'), github.event.client_payload.slug)
+    if: github.event_name == 'workflow_dispatch' || contains(fromJSON('["mlx-agent","obsidian-agent","loop-killer","agent-sessions","secure-agent"]'), github.event.client_payload.slug)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -81,7 +81,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
-          git add -A -- releases.json .claude-plugin providers packages
+          git add -A -- catalog.json releases.json .claude-plugin providers packages
           git commit -m "chore: sync $NAME $TAG"
           git push origin "$branch"
           body="$(mktemp)"
