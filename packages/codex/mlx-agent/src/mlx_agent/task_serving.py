@@ -273,6 +273,7 @@ class TaskModelWorker(ModelWorker):
     def _stop_worker(self):
         try:
             self.resident.close()
+            self.worker_launch_pending = False
             self.execution_unresolved = False
             self._release_memory()
         finally:
@@ -313,14 +314,18 @@ class TaskModelWorker(ModelWorker):
         record = None
         try:
             self._recheck_identity()
-            if kind.input_media:
+            from .task_inputs import needs_named
+            if needs_named(request):
+                staged = self.store.stage_inputs(request)
+            elif kind.input_media:
                 staged = self.store.stage_input(request['parameters'][kind.input_field], kind.input_media)
             with tempfile.TemporaryDirectory(prefix='mlx-task-endpoint-plan-') as directory:
-                plan = kind.plan(request, Path(directory), staged['staging_path'] if staged else None)
+                media = staged.get('paths', staged.get('staging_path')) if staged else None
+                plan = kind.plan(request, Path(directory), media)
                 if plan['backend'] != self.config['task_identity']['backend'] or plan['argv'][0] != self.resident.executable:
                     raise TaskError('identity_changed', 'The model task backend changed; review serving again.')
             record = self.store.create(request, self.config['task_identity'],
-                input_artifact=staged['reference'] if staged else None, staged_input=staged)
+                input_artifact=staged.get('reference') if staged else None, staged_input=staged)
             staged = None
             owner = process_identity(os.getpid())
             if not owner:
@@ -417,7 +422,10 @@ class TaskModelWorker(ModelWorker):
             request = self.store.read_request(identifier)
             kind = task_kinds.get(request['kind'])
             directory = self.store.artifact_path(identifier, 'result.json').parent
-            media = str(self.store.verify_input_artifact(identifier, record['input_artifact'], kind.input_media)) if kind.input_media else None
+            if record['schema'] == 'task-run/3':
+                media = self.store.verify_named_inputs(identifier, request, record['input_artifacts'])
+            else:
+                media = str(self.store.verify_input_artifact(identifier, record['input_artifact'], kind.input_media)) if kind.input_media else None
             plan = kind.plan(request, directory, media)
             if plan['backend'] != record['identity']['backend'] or plan['argv'][0] != self.resident.executable:
                 raise TaskError('identity_changed', 'The model task backend changed.')
@@ -435,12 +443,16 @@ class TaskModelWorker(ModelWorker):
                 self.model_state = 'loading' if not self.resident.loaded else 'loaded'
             if self.resident.process is None:
                 self._launching_memory()
+                with self.condition:
+                    self.worker_launch_pending = True
+                    self._persist()
                 self.resident._start(cancelled=lambda: self.closed or self.store.get(identifier)['cancel_requested'])
             with self.condition:
                 if self.closed:
                     raise InterruptedError('Endpoint stopping.')
                 self.process = self.resident.process
                 self.worker_argv = list(self.process.args)
+                self.worker_launch_pending = False
                 self._persist()
             lease.bind_process_group(self.process.pid)
             worker_identity = process_identity(self.process.pid)
@@ -450,13 +462,17 @@ class TaskModelWorker(ModelWorker):
                 self._bind_memory(self.process, worker_identity)
             self.store.transition(identifier, ('starting',), {'state': 'running', 'execution': {'pid': self.process.pid, 'identity': worker_identity}})
             dispatched = True
-            result = kind.run(plan, runner=lambda argv, **options: self.resident.run(argv,
+            from functools import partial
+            runner = partial(self.resident.run,
                 cancelled=lambda: self.closed or self.store.get(identifier)['cancel_requested'],
-                cache_policy=allocator_cache.from_memory(self.memory_policy), memory_limit_bytes=worker_limit, **options))
+                cache_policy=allocator_cache.from_memory(self.memory_policy), memory_limit_bytes=worker_limit)
+            result = kind.run(plan, runner=runner)
             self._recheck_identity()
             check_identity(record['identity'])
             self.store.read_request(identifier)
-            if kind.input_media:
+            if record['schema'] == 'task-run/3':
+                result['input_artifacts'] = record['input_artifacts']
+            elif kind.input_media:
                 result['input_artifact'] = record['input_artifact']
             if kind.output:
                 output = self.store.artifact_path(identifier, kind.output)

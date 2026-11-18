@@ -930,6 +930,22 @@ def _run_coding_bench(arguments):
 def _add_serve_arguments(parser):
     from .serve import MAX_TOKENS_DEFAULT
     actions = parser.add_subparsers(dest="serve_command", required=True)
+    tailnet = actions.add_parser("tailnet", help="share an authenticated managed endpoint over Tailscale")
+    tailnet_actions = tailnet.add_subparsers(dest="tailnet_command", required=True)
+    tailnet_start = tailnet_actions.add_parser("start", help="review and supervise one sharing session")
+    tailnet_start.add_argument("--port", type=int, required=True)
+    tailnet_start.add_argument("--https-port", type=int, default=8443)
+    tailnet_start.add_argument("--receipts-dir")
+    tailnet_start.add_argument("--confirm", action="store_true")
+    tailnet_start.add_argument("--preview-hash")
+    tailnet_start.add_argument("--watch-parent", action="store_true")
+    tailnet_start.add_argument("--share-id")
+    tailnet_start.add_argument("--json", action="store_true")
+    tailnet_status = tailnet_actions.add_parser("status", help="inspect the managed share")
+    tailnet_status.add_argument("--json", action="store_true")
+    tailnet_stop = tailnet_actions.add_parser("stop", help="stop the owned share")
+    tailnet_stop.add_argument("--expected-share-id")
+    tailnet_stop.add_argument("--json", action="store_true")
     service = actions.add_parser("protected-service", help="run an authenticated private-worker gateway in the foreground")
     service.add_argument("--describe", action="store_true")
     service.add_argument("--model")
@@ -943,6 +959,8 @@ def _add_serve_arguments(parser):
     front_key.add_argument("--api-key-file")
     front_key.add_argument("--api-key-sha256")
     front.add_argument("--receipts-dir", action="append", default=[])
+    front.add_argument("--watch-parent", action="store_true")
+    front.add_argument("--json", action="store_true")
     private = actions.add_parser("private-worker", help="serve an existing model over a supervisor-owned Unix listener")
     private.add_argument("--describe", action="store_true", help="report the private transport protocol without starting a model")
     private.add_argument("--model")
@@ -958,7 +976,9 @@ def _add_serve_arguments(parser):
     start.add_argument("--runtime", required=True, choices=["auto", "mlx_lm", "mlx-vlm", "strata", "splash", "tasks"])
     start.add_argument("--splash-draft-model", help="local DFlash2 draft directory (default: the family's draft in the Hugging Face cache)")
     start.add_argument("--splash-max-memory-gb", type=float, help="Splash Metal memory ceiling in decimal GB (1–1024); it can only lower Splash's own plan")
-    start.add_argument("--splash-max-context", type=int, help="Splash context limit in tokens (512–1010000)")
+    start.add_argument("--splash-max-context", dest="splash_max_context_tokens", type=int, help="Splash context limit in tokens (512–1010000)")
+    _add_splash_tuning_arguments(start)
+    start.add_argument("--splash-chat-template", help="local Jinja chat template file that replaces the model's own")
     decoding = start.add_mutually_exclusive_group()
     decoding.add_argument("--strata-speculation", choices=["on", "off"], help="legacy Strata draft-and-verify switch (default: off)")
     decoding.add_argument("--strata-decoding", choices=["plain", "lookup", "mtp"], help="Strata verified decoding mode; lookup needs no draft weights")
@@ -977,6 +997,7 @@ def _add_serve_arguments(parser):
                        help="opt-in M5 affine Q4 prompt kernel; unsupported hardware/models use native MLX")
     start.add_argument("--prompt-lookup", action="store_true",
                        help="opt-in code-edit decoding; plain greedy requests run one at a time")
+    start.add_argument("--shared-prefix-cache-mib", type=int, help="reuse instruction prefixes within a keyed project endpoint (16–2048 MiB)")
     start.add_argument("--vision-cache", action="store_true",
                        help="opt-in bounded Qwen2.5-VL and Qwen3-VL image feature reuse with MLX-VLM")
     start.add_argument("--jit", action="store_true", help="keep endpoint reachable; load local weights on inference requests")
@@ -996,6 +1017,7 @@ def _add_serve_arguments(parser):
     stop.add_argument("--receipts-dir", default=None)
     stop.add_argument("--expected-pid", type=int, default=None)
     stop.add_argument("--expected-start", default=None, help="process start identity returned by service discovery")
+    stop.add_argument("--if-idle", action="store_true", help="stop a Splash JIT endpoint only when idle")
     stop.add_argument("--json", action="store_true")
     unload = actions.add_parser("unload", help="release JIT model weights while keeping the endpoint reachable")
     unload.add_argument("--port", type=int, required=True)
@@ -1019,6 +1041,12 @@ def _add_serve_arguments(parser):
     status = actions.add_parser("status", help="cross-check serve receipts against live processes")
     status.add_argument("--receipts-dir", default=None)
     status.add_argument("--json", action="store_true")
+    duplication = actions.add_parser("duplication-policy", help="inspect or update the host model duplication policy")
+    selection = duplication.add_mutually_exclusive_group()
+    selection.add_argument("--allow-model", action="append", metavar="MODEL")
+    selection.add_argument("--clear", action="store_true")
+    duplication.add_argument("--confirm", action="store_true")
+    duplication.add_argument("--json", action="store_true")
     budget = actions.add_parser('budget', help='inspect or configure the shared agent memory budget')
     budget.add_argument('--limit-gb', type=float)
     budget.add_argument('--reserve-gb', type=float, default=8)
@@ -1037,6 +1065,9 @@ def _add_serve_arguments(parser):
             action.add_argument("--min-headroom-gb", type=float, required=True)
             action.add_argument("--strata-context-tokens", type=int, default=None)
             action.add_argument("--strata-decoding", choices=["plain", "lookup", "mtp"], default=None)
+            action.add_argument("--splash-max-memory-gb", type=float, default=None)
+            action.add_argument("--splash-max-context", dest="splash_max_context_tokens", type=int, default=None)
+            _add_splash_tuning_arguments(action)
             action.add_argument("--idle-timeout", type=int, default=300)
             action.add_argument("--keep-loaded", action="store_true")
             action.add_argument("--unload-under-pressure", action=argparse.BooleanOptionalAction, default=True)
@@ -1046,14 +1077,19 @@ def _add_serve_arguments(parser):
             action.add_argument("--replace", action="store_true")
     workflow = actions.add_parser("workflow", help="manage local serving workflows")
     workflow_actions = workflow.add_subparsers(dest="workflow_command", required=True)
-    for command in ("save", "show", "list", "delete", "preview", "start", "status", "stop", "resolve"):
+    for command in ("save", "show", "list", "delete", "preview", "start", "status", "stop", "resolve", "stage", "handoff"):
         action = workflow_actions.add_parser(command)
         if command != "list":
             action.add_argument("--name", required=True)
         if command == "save":
             action.add_argument("--file", required=True)
-        if command == "resolve":
+        if command in ("resolve", "handoff"):
             action.add_argument("--role", required=True)
+        if command == "stage":
+            action.add_argument("--role", action="append", required=True)
+        if command == "handoff":
+            action.add_argument("--task-id", required=True)
+            action.add_argument("--out")
         if command == "start":
             action.add_argument("--confirm", action="store_true", required=True)
             action.add_argument("--preview-hash", required=True)
@@ -1062,6 +1098,29 @@ def _add_serve_arguments(parser):
     discover = actions.add_parser("discover", help="find engine services across registered and live receipt locations")
     discover.add_argument("--receipts-dir", action="append", default=[])
     discover.add_argument("--json", action="store_true")
+
+
+def _add_splash_tuning_arguments(parser):
+    from .splash_runtime import EFFORTS
+    parser.add_argument("--splash-verify-rows", choices=["auto", "all"],
+                        help="rows each decode cycle verifies; all keeps greedy and seeded output repeatable (default: auto)")
+    parser.add_argument("--splash-cached-states", choices=["int8", "exact"],
+                        help="cached recurrent state storage; exact keeps full precision at about 3x the memory (default: int8)")
+    parser.add_argument("--splash-kv-format", choices=["int8", "bf16"],
+                        help="KV cache storage; bf16 uses about twice the KV memory (default: int8)")
+    parser.add_argument("--splash-reasoning-effort", choices=list(EFFORTS),
+                        help="reasoning effort of every request, whatever the client asks; none turns thinking off")
+    parser.add_argument("--splash-thinking-budget", dest="splash_thinking_token_budget", type=int,
+                        help="thinking tokens of a request that sets no budget (0–1010000)")
+    parser.add_argument("--splash-persistent-cache", action=argparse.BooleanOptionalAction, default=None,
+                        help="keep Splash's SSD prompt cache across restarts")
+    parser.add_argument("--splash-max-cache-disk-gb", type=float,
+                        help="SSD prompt cache quota in decimal GB (0 turns the cache off; default: Splash's own)")
+
+
+def _splash_tuning(arguments):
+    from .splash_runtime import TUNING
+    return {key: getattr(arguments, key) for key in TUNING if getattr(arguments, key) is not None}
 
 
 def _add_allocator_cache_arguments(parser):
@@ -1103,13 +1162,88 @@ def _start_memory_policy(arguments, runtime):
     return for_start(arguments, runtime)
 
 
+def _run_tailnet(arguments):
+    import hmac
+    import sys
+    import uuid
+    from . import tailnet
+    operation = "serve-tailnet-{}".format(arguments.tailnet_command)
+    parent = os.getppid()
+    emitted = False
+    try:
+        if arguments.tailnet_command == "status":
+            data = tailnet.status()
+        elif arguments.tailnet_command == "stop":
+            expected = str(uuid.UUID(arguments.expected_share_id)) if arguments.expected_share_id else None
+            data = tailnet.stop(expected)
+        else:
+            if arguments.preview_hash and not arguments.confirm:
+                raise ValueError("--preview-hash requires --confirm.")
+            if arguments.watch_parent and (not arguments.confirm or parent <= 1):
+                raise ValueError("--watch-parent requires a confirmed session with a live parent.")
+            if arguments.share_id and not arguments.confirm:
+                raise ValueError("--share-id requires --confirm.")
+            if arguments.share_id:
+                uuid.UUID(arguments.share_id)
+            data, binding, binary = tailnet.preview(arguments.port, arguments.https_port, arguments.receipts_dir)
+            if arguments.confirm:
+                if not arguments.preview_hash or not hmac.compare_digest(arguments.preview_hash, data["preview_hash"]):
+                    raise tailnet.TailnetError("tailnet_preview_changed", "The reviewed sharing preview changed.", "Preview sharing again.")
+            elif arguments.json:
+                if arguments.preview_hash:
+                    raise ValueError("--preview-hash requires --confirm.")
+                return _emit_serve_result(ResultEnvelope.ok(operation, data), True)
+            else:
+                if not sys.stdin.isatty():
+                    raise ValueError("Interactive sharing requires a terminal.")
+                print(json.dumps(data, indent=2))
+                if input("Share this endpoint with the tailnet? [y/N] ").strip().lower() not in ("y", "yes"):
+                    return 0
+            def ready(value):
+                nonlocal emitted
+                emitted = True
+                if arguments.json:
+                    print(json.dumps(ResultEnvelope.ok(operation, value).to_dict()), flush=True)
+                else:
+                    print(json.dumps(value, indent=2), flush=True)
+            tailnet.run_session(data, binding, binary, ready, arguments.watch_parent, arguments.share_id, parent)
+            return 0
+        return _emit_serve_result(ResultEnvelope.ok(operation, data), arguments.json)
+    except tailnet.TailnetError as error:
+        result = ResultEnvelope.fail(operation, error.code, str(error), error.remediation)
+    except (OSError, ValueError, TypeError) as error:
+        result = ResultEnvelope.fail(operation, "tailnet_unavailable", str(error), "Check sharing settings and retry.")
+    if emitted:
+        print("Sharing stopped: {}".format(result.error.message), file=sys.stderr, flush=True)
+        return 2
+    return _emit_serve_result(result, arguments.json)
+
+
 def _run_serve(arguments):
+    if arguments.serve_command == "tailnet":
+        return _run_tailnet(arguments)
     from .serve import (
         ServeError, configure_serve_memory, reclaim_serve_cache, default_model_present, load_recipes, plan_start, resolve_serve_runtime,
         start_serve, status_serve, stop_serve, unload_serve, wired_port_claim,
     )
+    from .model_serving import ModelServingError
+    from .inference_runner import InferenceError
+    from .task_contracts import TaskError
     operation = "serve-{0}".format(arguments.serve_command)
     try:
+        if arguments.serve_command == "duplication-policy":
+            from .model_serving import read_policy, resolve_model, write_policy
+            selection = arguments.allow_model is not None or arguments.clear
+            if arguments.confirm and not selection:
+                raise ValueError("--confirm requires --allow-model or --clear.")
+            if not selection:
+                data = read_policy()
+            else:
+                models = sorted(set(resolve_model(item) for item in (arguments.allow_model or [])))
+                data = (write_policy(models) if arguments.confirm else
+                        {"schema_version": 1, "duplicate_model_allowlist": models, "status": "preview"})
+            return _emit_serve_result(ResultEnvelope.ok(operation, data), arguments.json,
+                                      human=json.dumps(data, indent=2))
         if arguments.serve_command == 'budget':
             import math
             from .residency import MemoryRegistry
@@ -1130,8 +1264,10 @@ def _run_serve(arguments):
             command = arguments.profile_command
             if command == "save":
                 keys = ("memory_budget_gb", "min_headroom_gb", "strata_context_tokens", "strata_decoding",
+                        "splash_max_memory_gb", "splash_max_context_tokens",
                         "idle_timeout", "keep_loaded", "unload_under_pressure")
                 settings = {key: getattr(arguments, key) for key in keys if getattr(arguments, key) is not None}
+                settings.update(_splash_tuning(arguments))
                 strata = any(key in settings for key in ("strata_context_tokens", "strata_decoding"))
                 if strata:
                     settings.setdefault("strata_context_tokens", 16384)
@@ -1155,7 +1291,14 @@ def _run_serve(arguments):
         if arguments.serve_command == "workflow":
             from . import workflow_sets
             command = arguments.workflow_command
-            if command in ("start", "status", "stop", "resolve"):
+            if command in ("stage", "handoff"):
+                from . import workflow_operations
+                if command == "stage":
+                    data = workflow_operations.stage(arguments.name, arguments.role, receipts_dir=arguments.receipts_dir)
+                else:
+                    data = workflow_operations.handoff(arguments.name, arguments.role, arguments.task_id,
+                                                       out=arguments.out, receipts_dir=arguments.receipts_dir)
+            elif command in ("start", "status", "stop", "resolve"):
                 from . import workflow_activation
                 if command == "start":
                     data = workflow_activation.start_workflow(arguments.name, arguments.preview_hash, receipts_dir=arguments.receipts_dir)
@@ -1179,6 +1322,10 @@ def _run_serve(arguments):
             else:
                 definition = workflow_sets.load_workflow(arguments.name, arguments.receipts_dir)
                 data = workflow_sets.preview_workflow(definition, receipts_dir=arguments.receipts_dir) if command == "preview" else definition
+            if data.get('error_code') == 'model_already_served':
+                return _emit_serve_result(ResultEnvelope.fail(operation, data['error_code'], data['error'],
+                    'Use the existing compatible endpoint with your authorized key.', data=data['error_data']),
+                    arguments.json)
             return _emit_serve_result(ResultEnvelope.ok(operation, data), arguments.json,
                                       human=json.dumps(data, indent=2))
         if arguments.serve_command == "discover":
@@ -1195,7 +1342,8 @@ def _run_serve(arguments):
         if arguments.serve_command == "stop":
             outcome = stop_serve(arguments.port, arguments.receipts_dir, **(
                 {**({"expected_pid": arguments.expected_pid} if arguments.expected_pid is not None else {}),
-                 **({"expected_start": arguments.expected_start} if arguments.expected_start is not None else {})}))
+                 **({"expected_start": arguments.expected_start} if arguments.expected_start is not None else {}),
+                 **({"if_idle": True} if arguments.if_idle else {})}))
             return _emit_serve_result(
                 ResultEnvelope.ok(operation, outcome), arguments.json,
                 human="serve {0}: port {1} (pid {2})".format(
@@ -1239,6 +1387,10 @@ def _run_serve(arguments):
         if arguments.profile and any(key in settings for key in ("strata_context_tokens", "strata_decoding")) and runtime != "strata":
             raise ServeError("invalid_arguments", "Profiles with Strata settings require the Strata runtime.",
                              "Select a prepared Strata model or a profile containing only common settings.")
+        from .serve_profiles import SPLASH_FIELDS
+        if arguments.profile and SPLASH_FIELDS & set(settings) and runtime != "splash":
+            raise ServeError("invalid_arguments", "Profiles with Splash settings require the Splash runtime.",
+                             "Select the Splash runtime or a profile containing only common settings.")
         if arguments.strata_speculation is not None and runtime != "strata":
             raise ServeError("invalid_arguments", "--strata-speculation requires the Strata runtime.", "Select a prepared local Strata profile.")
         plan = plan_start(
@@ -1267,10 +1419,13 @@ def _run_serve(arguments):
             default_top_p=arguments.default_top_p,
             m5_prefill=arguments.m5_prefill,
             prompt_lookup=arguments.prompt_lookup,
+            shared_prefix_cache_mib=arguments.shared_prefix_cache_mib,
             vision_cache=arguments.vision_cache,
             splash_draft_model=arguments.splash_draft_model,
             splash_max_memory_gb=arguments.splash_max_memory_gb,
-            splash_max_context_tokens=arguments.splash_max_context,
+            splash_max_context_tokens=arguments.splash_max_context_tokens,
+            splash_tuning=_splash_tuning(arguments),
+            splash_chat_template=arguments.splash_chat_template,
         )
         if arguments.launchd:
             if plan.get("jit"):
@@ -1300,6 +1455,7 @@ def _run_serve(arguments):
             preview_hash=arguments.preview_hash,
             model_present=default_model_present(arguments.hf_cache),
             wired_claims=wired_claims,
+            hf_cache=arguments.hf_cache,
         )
         receipt = outcome["receipt"]
         served_model = receipt["repo"] or receipt.get("path")
@@ -1309,7 +1465,9 @@ def _run_serve(arguments):
                 served_model, receipt["port"], receipt["pid"], receipt["log_path"]
             ),
         )
-    except ServeError as error:
+    except (ServeError, ModelServingError) as error:
+        result = ResultEnvelope.fail(operation, error.code, str(error), error.remediation, data=error.data)
+    except (InferenceError, TaskError) as error:
         result = ResultEnvelope.fail(operation, error.code, str(error), error.remediation)
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         result = ResultEnvelope.fail(
@@ -1325,6 +1483,8 @@ def _run_serve(arguments):
         print("serve failed [{0}]: {1}\nremediation: {2}".format(
             payload["code"], payload["message"], payload["remediation"]
         ))
+        if result.data.get('existing_services'):
+            print(json.dumps(result.data['existing_services'], indent=2))
     return 2
 
 
@@ -1339,9 +1499,6 @@ def _run_serve_launchd(arguments, plan, operation):
     )
     target = launchd_dir / "{0}.plist".format(launchd_label(plan["port"]))
     log_path = str(receipts_root(arguments.receipts_dir) / "{0}.log".format(plan["port"]))
-    content = render_launchd_plist(plan, log_path=log_path)
-    adapter = LaunchdPlistAdapter(target)
-    adapter.validate(content)
     if target.exists():
         result = ResultEnvelope.fail(
             operation,
@@ -1366,7 +1523,8 @@ def _run_serve_launchd(arguments, plan, operation):
             "Download it with the runtime's own pull command first; serve never downloads.",
         )
         return _emit_serve_result(result, arguments.json)
-    if plan["path"] is not None and not Path(plan["path"]).is_dir():
+    if plan["path"] is not None and not (Path(plan["path"]).is_dir()
+                                               or plan["runtime"] == "splash" and Path(plan["path"]).is_file()):
         result = ResultEnvelope.fail(
             operation,
             "model_not_local",
@@ -1374,6 +1532,9 @@ def _run_serve_launchd(arguments, plan, operation):
             "Point --path at an existing local model directory; serve never downloads models.",
         )
         return _emit_serve_result(result, arguments.json)
+    content = render_launchd_plist(plan, log_path=log_path, hf_cache=arguments.hf_cache)
+    adapter = LaunchdPlistAdapter(target)
+    adapter.validate(content)
     transaction = Transaction(receipts_dir=arguments.receipts_dir)
     preview = transaction.preview([{
         "path": str(target), "content": content, "runtime": "launchd",
@@ -1428,6 +1589,8 @@ def _emit_serve_result(result, as_json, human=None):
         print("{0} failed [{1}]: {2}\nremediation: {3}".format(
             result.operation, payload["code"], payload["message"], payload["remediation"]
         ))
+        if result.data.get('existing_services'):
+            print(json.dumps(result.data['existing_services'], indent=2))
     return 0 if result.status == "ok" else 2
 
 
@@ -2099,6 +2262,10 @@ def _add_convert_arguments(parser):
                        help="adaptive residual reuse for Wan2.1 T2V; may change generated frames")
     video.add_argument("--cache-memory-mib", type=int, default=256,
                        help="adaptive feature-memory cap in MiB, 8..4096 (default: 256)")
+    video.add_argument("--image", default=None, help="absolute first-frame image (png, jpg, webp); LTX-2.3 models")
+    video.add_argument("--audio", default=None,
+                       help="absolute audio file the video follows and carries (wav, flac, mp3, m4a, aac); LTX-2.3 models")
+    video.add_argument("--audio-start", type=float, default=None, help="seconds into --audio where the video starts (default 0)")
     video.add_argument("--timeout", type=int, default=3600, help="seconds before the backend run is stopped")
     video.add_argument("--json", action="store_true")
 
@@ -2192,8 +2359,7 @@ def _run_convert(arguments):
                              max_faces=arguments.max_faces, denoiser_cache=arguments.denoiser_cache,
                              cache_memory_mib=arguments.cache_memory_mib, views=arguments.view,
                              guide=arguments.guide)
-            from .compute import guarded_start
-            result = guarded_start("mesh", run_mesh, plan, timeout=arguments.timeout)
+            result = served_or_local("mesh", run_mesh, plan, arguments.out)
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["path"])
         if arguments.convert_command == "video":
             if not 1 <= arguments.timeout <= 14400:
@@ -2201,7 +2367,8 @@ def _run_convert(arguments):
             plan = plan_video(arguments.path, arguments.prompt, arguments.out, width=arguments.width,
                               height=arguments.height, frames=arguments.frames, fps=arguments.fps,
                               steps=arguments.steps, seed=arguments.seed,
-                              denoiser_cache=arguments.denoiser_cache, cache_memory_mib=arguments.cache_memory_mib)
+                              denoiser_cache=arguments.denoiser_cache, cache_memory_mib=arguments.cache_memory_mib,
+                              image=arguments.image, audio=arguments.audio, audio_start=arguments.audio_start)
             result = served_or_local("video", run_video, plan, arguments.out)
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["path"])
         if arguments.convert_command == "scan":
@@ -2936,8 +3103,13 @@ def main(argv=None):
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw[:2] == ["serve", "protected-service"]:
         from .protected_service import main as service_main
+        from .model_serving import ModelServingError
         try:
             return service_main(raw[2:])
+        except ModelServingError as error:
+            print(json.dumps(ResultEnvelope.fail('serve-protected-service', error.code, str(error),
+                                                 error.remediation, data=error.data).to_dict()), file=sys.stderr)
+            return 1
         except (OSError, ValueError, ImportError, RuntimeError):
             print("Protected MLX service unavailable; verify its runtime, private key and local model.", file=sys.stderr)
             return 1

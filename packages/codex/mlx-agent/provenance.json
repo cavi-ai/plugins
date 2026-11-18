@@ -1,6 +1,6 @@
 {
   "repository": "cavi-ai/mlx-agent",
-  "source_commit": "96995d85ba0ae369dbf1d6c1c570ab012a1bbbec",
+  "source_commit": "c4c04b4cbbdf563fa3ae931f9a584bb7f0b240d5",
   "source_path": "providers/codex",
   "included": [
     ".codex-plugin",
@@ -17,6 +17,6 @@
   "exclusion_reason": "Codex skills use the packaged CLI entrypoint; MCP transport artifacts are not required or distributed by this catalog.",
   "integrity": {
     "algorithm": "sha256",
-    "tree": "7317af0f4afada75a7f4b7a86310eb49ca2c431b81a9506ea5a3638dab81892a"
+    "tree": "53d1f99584872291059de73a05036d3c0e88232a21f96fc4bc7c759d8b55696e"
   }
 }

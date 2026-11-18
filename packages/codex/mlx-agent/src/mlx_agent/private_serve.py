@@ -37,10 +37,14 @@ class UnixHTTPConnection(http.client.HTTPConnection):
             raise
 
 
-def worker_command(native, model, descriptor):
+def worker_command(native, model, descriptor, shared_prefix_cache=None):
     python = runtime_python(native[0])
+    options = []
+    if shared_prefix_cache is not None:
+        options = ["--shared-prefix-mib", str(shared_prefix_cache["mib"]),
+                   "--shared-prefix-fingerprint", shared_prefix_cache["runtime"]["fingerprint"]]
     return [python, str(Path(__file__).resolve()), "--runtime-child", "--model", model,
-            "--socket-fd", str(descriptor), "--"] + native[1:]
+            "--socket-fd", str(descriptor)] + options + ["--"] + native[1:]
 
 
 class PrivateEndpoint:
@@ -67,8 +71,11 @@ class PrivateEndpoint:
 
 
 def identity():
-    return {"protocol": PRIVATE_PROTOCOL,
-            "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+    digest = hashlib.sha256()
+    for path in (Path(__file__), Path(__file__).with_name('model_serving.py')):
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
+    return {"protocol": PRIVATE_PROTOCOL, "source_sha256": digest.hexdigest()}
 
 
 def private_server_class(descriptor):
@@ -229,7 +236,7 @@ def runtime_python(executable):
     raise ValueError("The MLX entrypoint does not identify its virtual environment interpreter.")
 
 
-def run_runtime(model, descriptor, forwarded):
+def run_runtime(model, descriptor, forwarded, shared_prefix_mib=None, shared_prefix_fingerprint=None):
     digest = os.environ.pop('MLX_AGENT_WORKER_KEY_SHA256', None)
     if digest is not None:
         if __package__:
@@ -240,41 +247,84 @@ def run_runtime(model, descriptor, forwarded):
     # Adopt the listener before importing a runtime that could load weights.
     server_class = private_server_class(descriptor)
     os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
+    restore = lambda: None
+    if shared_prefix_mib is not None:
+        from mlx_agent.shared_prefix_cache import identity_here, supported
+        actual = identity_here()
+        if (not 16 <= shared_prefix_mib <= 2048 or not supported(actual)
+                or actual['fingerprint'] != shared_prefix_fingerprint):
+            raise ValueError("Shared prefix runtime identity changed.")
     from mlx_lm import server
-    original_run = server.run
-    parameters = inspect.signature(original_run).parameters
-    if "server_class" not in parameters or "handler_class" not in parameters:
-        raise ValueError("This MLX-LM version cannot serve an inherited private listener.")
-    local = Path(model).expanduser()
-    if not local.is_dir():
-        from huggingface_hub import try_to_load_from_cache
-        cached = try_to_load_from_cache(model, "config.json")
-        if not isinstance(cached, str):
-            raise ValueError("Prepare the model in the local cache before managed serving.")
-        local = Path(cached).parent
-    local = local.resolve()
-    maximum = 8192
-    if "--max-tokens" in forwarded:
-        maximum = int(forwarded[forwarded.index("--max-tokens") + 1])
-        if not 1 <= maximum <= 65536:
-            raise ValueError("Invalid private worker token limit.")
-    handler = guarded_handler(server.APIHandler, str(local), maximum, aliases=(model,))
-
-    def private_run(*args, **kwargs):
-        if len(args) > 3:
-            raise ValueError("Unsupported MLX-LM server initialization.")
-        return original_run(*args, **dict(kwargs, server_class=server_class, handler_class=handler))
-
-    previous = sys.argv
-    server.run = private_run
+    if shared_prefix_mib is not None:
+        from mlx_agent.shared_prefix_cache import install
+        restore = install(server, shared_prefix_mib * (1 << 20))
     try:
-        # Locked arguments come last: forwarded serving options cannot select a
-        # different model, host, or public listener.
-        sys.argv = [previous[0]] + forwarded + ["--model", str(local), "--host", "127.0.0.1", "--port", "0", "--log-level", "ERROR"]
-        server.main()
+        original_run = server.run
+        absent = object()
+        original_factory = getattr(server, "_run_http_server", absent)
+        if original_factory is not absent:
+            try:
+                factory_signature = inspect.signature(original_factory)
+                parameters = factory_signature.parameters
+                if any(name not in parameters or parameters[name].kind in (inspect.Parameter.VAR_POSITIONAL,
+                                                                           inspect.Parameter.VAR_KEYWORD)
+                       for name in ("server_class", "handler_class")):
+                    raise ValueError()
+                probe = factory_signature.bind_partial(None, None, None)
+                if "server_class" in probe.arguments or "handler_class" in probe.arguments:
+                    raise ValueError()
+                probe.arguments.update(server_class=object(), handler_class=object())
+                factory_signature.bind(*probe.args, **probe.kwargs)
+            except (TypeError, ValueError):
+                raise ValueError("This MLX-LM version cannot serve an inherited private listener.") from None
+        else:
+            if shared_prefix_mib is not None:
+                raise ValueError("Unsupported private HTTP runtime.")
+            parameters = inspect.signature(original_run).parameters
+            if "server_class" not in parameters or "handler_class" not in parameters:
+                raise ValueError("This MLX-LM version cannot serve an inherited private listener.")
+        local = Path(model).expanduser()
+        if not local.is_dir():
+            from huggingface_hub import try_to_load_from_cache
+            cached = try_to_load_from_cache(model, "config.json")
+            if not isinstance(cached, str):
+                raise ValueError("Prepare the model in the local cache before managed serving.")
+            local = Path(cached).parent
+        local = local.resolve()
+        maximum = 8192
+        if "--max-tokens" in forwarded:
+            maximum = int(forwarded[forwarded.index("--max-tokens") + 1])
+            if not 1 <= maximum <= 65536:
+                raise ValueError("Invalid private worker token limit.")
+        handler = guarded_handler(server.APIHandler, str(local), maximum, aliases=(model,))
+
+        def private_run(*args, **kwargs):
+            if len(args) > 3:
+                raise ValueError("Unsupported MLX-LM server initialization.")
+            return original_run(*args, **dict(kwargs, server_class=server_class, handler_class=handler))
+
+        def private_factory(*args, **kwargs):
+            bound = factory_signature.bind(*args, **kwargs)
+            bound.arguments.update(server_class=server_class, handler_class=handler)
+            return original_factory(*bound.args, **bound.kwargs)
+
+        previous = sys.argv
+        if original_factory is not absent:
+            server._run_http_server = private_factory
+        else:
+            server.run = private_run
+        try:
+            # Locked arguments come last: forwarded serving options cannot select a
+            # different model, host, or public listener.
+            sys.argv = [previous[0]] + forwarded + ["--model", str(local), "--host", "127.0.0.1", "--port", "0", "--log-level", "ERROR"]
+            server.main()
+        finally:
+            server.run = original_run
+            if original_factory is not absent:
+                server._run_http_server = original_factory
+            sys.argv = previous
     finally:
-        server.run = original_run
-        sys.argv = previous
+        restore()
 
 
 def main(argv=None):
@@ -283,6 +333,8 @@ def main(argv=None):
     parser.add_argument("--model")
     parser.add_argument("--socket-fd", type=int)
     parser.add_argument("--runtime-executable", default="mlx_lm.server")
+    parser.add_argument("--shared-prefix-mib", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--shared-prefix-fingerprint", help=argparse.SUPPRESS)
     parser.add_argument("--runtime-child", action="store_true", help=argparse.SUPPRESS)
     args, forwarded = parser.parse_known_args(argv)
     if args.describe:
@@ -294,20 +346,26 @@ def main(argv=None):
         parser.error("a model and supervisor-owned --socket-fd >= 3 are required")
     if forwarded[:1] == ["--"]:
         forwarded = forwarded[1:]
+    if not __package__:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from mlx_agent.model_serving import verify_private_worker
+    verify_private_worker(args.model, args.socket_fd)
     if not args.runtime_child:
         python = runtime_python(args.runtime_executable)
         os.set_inheritable(args.socket_fd, True)
         command = [python, str(Path(__file__).resolve()), "--runtime-child", "--model", args.model,
                    "--socket-fd", str(args.socket_fd), "--"] + forwarded
         os.execv(python, command)
-    run_runtime(args.model, args.socket_fd, forwarded)
+    if (args.shared_prefix_mib is None) != (args.shared_prefix_fingerprint is None):
+        parser.error("shared prefix configuration is incomplete")
+    run_runtime(args.model, args.socket_fd, forwarded, args.shared_prefix_mib, args.shared_prefix_fingerprint)
     return 0
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, ImportError):
+    except (OSError, ValueError, ImportError, RuntimeError):
         # Runtime errors may include private paths or request content.
         print("Private MLX worker unavailable; verify the installed runtime and local model.", file=sys.stderr)
         raise SystemExit(1)
