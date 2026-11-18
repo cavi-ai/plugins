@@ -4,6 +4,7 @@ serve and jit_serve import this module. The checks import those modules back,
 so those imports stay inside the checks.
 """
 from pathlib import Path
+import subprocess
 
 
 def _rejected(code, message, remediation):
@@ -133,16 +134,18 @@ def _require_vision_identity(plan):
 def _require_splash_identity(plan):
     if plan.get("runtime") != "splash":
         return
-    from .splash_runtime import SplashError, installed_runtime, read_draft, read_target
+    from .splash_runtime import SplashError, installed_runtime, read_chat_template, read_draft, read_target
 
     try:
         current = (read_target(plan["splash_model_dir"])["fingerprint"],
                    read_draft(plan["splash_draft_model"])["fingerprint"] if plan.get("splash_draft_model") else None,
-                   installed_runtime(plan["splash_launcher"])["fingerprint"])
+                   installed_runtime(plan["splash_launcher"])["fingerprint"],
+                   read_chat_template(plan["splash_chat_template"])["sha256"] if plan.get("splash_chat_template") else None)
     except (SplashError, KeyError) as error:
         _rejected("preview_stale", str(error), "Review a fresh Splash serve plan.")
-    if current != (plan["splash_model_fingerprint"], plan["splash_draft_fingerprint"], plan["splash_runtime_fingerprint"]):
-        _rejected("preview_stale", "The Splash target, draft or launcher changed after preview.",
+    if current != (plan["splash_model_fingerprint"], plan["splash_draft_fingerprint"], plan["splash_runtime_fingerprint"],
+                   plan.get("splash_chat_template_sha256")):
+        _rejected("preview_stale", "The Splash target, draft, chat template or launcher changed after preview.",
                   "Review a fresh Splash serve plan.")
 
 
@@ -162,6 +165,23 @@ def _require_access_identity(plan):
     except (OSError, ValueError):
         _rejected("preview_stale", "Protected serving inputs changed after preview.",
                   "Review a fresh serve plan.")
+
+
+def _require_shared_prefix_identity(plan):
+    config = plan.get('shared_prefix_cache')
+    if config is None:
+        return
+    try:
+        from .private_serve import runtime_python
+        from .shared_prefix_cache import identity
+        if (not plan.get('jit') or plan.get('runtime') != 'mlx_lm' or not plan.get('access_key_file')
+                or not plan.get('api_key_sha256') or not plan.get('private_worker')
+                or type(config['mib']) is not int or not 16 <= config['mib'] <= 2048
+                or config['runtime'] != identity(runtime_python(plan['worker_argv'][0]))):
+            raise ValueError('Shared prefix configuration changed.')
+    except (OSError, ValueError, TypeError, KeyError, IndexError, subprocess.SubprocessError):
+        _rejected('preview_stale', 'Shared prefix configuration or runtime changed.',
+                  'Review a fresh serving preview.')
 
 
 def _require_model_identity(plan):
@@ -190,6 +210,7 @@ def recheck_bound_identity(plan):
         _require_vision_identity,
         _require_splash_identity,
         _require_access_identity,
+        _require_shared_prefix_identity,
         _require_model_identity,
     ):
         check(plan)

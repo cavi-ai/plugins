@@ -122,6 +122,7 @@ class ModelWorker:
         self.worker_group = None
         self.worker_identity = None
         self.worker_birth_identity = None
+        self.worker_launch_pending = False
         self._persisted_worker = None
         self._persisted_worker_start = None
         self.execution_unresolved = False
@@ -163,6 +164,7 @@ class ModelWorker:
             if path.is_symlink():
                 raise OSError("Refusing a symbolic-link worker state file.")
             state = {"gateway_pid": os.getpid(), "worker_pid": self.process.pid if self.process else None,
+                     "worker_launch_pending": self.worker_launch_pending,
                      "worker_argv": self.worker_argv, "model_state": self.model_state,
                      "last_memory_failure": self.last_memory_failure}
             if self.process:
@@ -537,7 +539,7 @@ class ModelWorker:
             if private:
                 from mlx_agent.private_serve import worker_command
                 descriptor = self.private_endpoint.listener.fileno()
-                argv = worker_command(argv, self.config["local_path"], descriptor)
+                argv = worker_command(argv, self.config["local_path"], descriptor, self.config.get("shared_prefix_cache"))
                 extra["pass_fds"] = (descriptor,)
             environment = dict(os.environ, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
             splash = self.config.get("runtime") == "splash"
@@ -568,12 +570,15 @@ class ModelWorker:
                             log.close()
                         raise GatewayError(503, "endpoint_stopping", "Endpoint is stopping.")
                     self.log = log
+                    self.worker_launch_pending = True
+                    self._persist()
                     self.process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log,
                         stderr=subprocess.STDOUT, env=environment, start_new_session=True, **extra)
                     self.worker_group = self.process.pid
                     if private:
                         self.private_endpoint.listener.close()
                     self.worker_port, self.worker_argv = (None if private else port), argv
+                    self.worker_launch_pending = False
                     self._persist()
                     process = self.process
                 os.close(ready_write)
@@ -706,6 +711,7 @@ class ModelWorker:
     def _stop_worker(self):
         if self.worker_group is not None:
             self._stop_group()
+            self.worker_launch_pending = False
             return
         with self.condition:
             process = self.process
@@ -743,6 +749,7 @@ class ModelWorker:
                 self.private_endpoint.close()
                 self.private_endpoint = None
         self._release_memory()
+        self.worker_launch_pending = False
 
     def _stop_group(self):
         with self.condition:
@@ -873,6 +880,22 @@ class ModelWorker:
                 self.closed = self.shutdown_requested
                 self.condition.notify_all()
                 self._persist()
+
+    def begin_idle_stop(self):
+        """Seal admission only if the Splash worker has no in-flight work."""
+        with self.condition:
+            if self.config.get("runtime") != "splash":
+                raise GatewayError(400, "unsupported_runtime", "Idle stop requires a Splash endpoint.")
+            if self.closed or self.shutdown_requested:
+                raise GatewayError(409, "endpoint_stopping", "Endpoint is already stopping.")
+            if (self.active_requests or self.cache_control_active or self.execution_unresolved
+                    or self.memory_budget_pending or self.worker_launch_pending
+                    or self.model_state in ("loading", "unloading")
+                    or self.execution.users or self.execution.waiting):
+                raise GatewayError(409, "model_busy", "Finish active requests before stopping.")
+            self.closed = True
+            self.shutdown_requested = True
+            self.condition.notify_all()
 
     def unload(self):
         with self.condition:
@@ -1181,7 +1204,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _dispatch_control(self, body):
         """Shared unload, cache, and policy routes for chat and task endpoints."""
-        if self.path == "/_mlx/unload":
+        if self.path == "/_mlx/idle-stop":
+            from mlx_agent.serve import _pid_start
+            pid, birth = body.get("pid"), body.get("process_started_at")
+            if (set(body) != {"pid", "process_started_at"} or type(pid) is not int or pid != os.getpid()
+                    or not isinstance(birth, str) or not birth or _pid_start(pid) != birth):
+                raise GatewayError(409, "server_changed", "The selected endpoint generation changed.")
+            self.server.controller.begin_idle_stop()
+            try:
+                self._json(200, {"accepted": True, "pid": pid, "process_started_at": birth})
+            finally:
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+        elif self.path == "/_mlx/unload":
             self._json(200, self.server.controller.unload())
         elif self.path == "/_mlx/cache":
             if body:
@@ -1194,6 +1228,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return True
 
     def do_POST(self):
+        if self.path.startswith('/v1/messages?'):
+            self.path = '/v1/messages'
         self._measurement = None
         self._inference_success = False
         connection = None
@@ -1202,7 +1238,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         response = upstream = None
         submitted = False
         try:
-            self._guard(control=self.path in ("/_mlx/unload", "/_mlx/policy", "/_mlx/cache"))
+            self._guard(control=self.path in ("/_mlx/unload", "/_mlx/policy", "/_mlx/cache", "/_mlx/idle-stop"))
             if self.headers.get("Transfer-Encoding"):
                 raise GatewayError(400, "invalid_body", "Use a bounded Content-Length request.")
             try:
@@ -1224,15 +1260,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if self._dispatch_control(body):
                 return
             translated = self.path in ("/v1/messages", "/v1/responses")
-            allow_images = self.server.config.get("runtime") == "mlx-vlm"
+            runtime = self.server.config.get("runtime")
+            allow_images = runtime == "mlx-vlm"
             if self.path == "/v1/messages":
                 try:
-                    body = to_chat_request(body, allow_images=allow_images)
+                    from mlx_agent.splash_runtime import supports_system_messages
+                    body = to_chat_request(body, allow_images=allow_images,
+                                           allow_system_messages=runtime == "splash" and supports_system_messages(
+                                               self.server.config.get("splash_version")))
                 except MessagesRequestError as error:
                     raise GatewayError(400, "invalid_request", str(error))
             elif self.path == "/v1/responses":
                 try:
-                    fields, body = responses_api.envelope(body), responses_api.to_chat_request(body, allow_images=allow_images)
+                    from mlx_agent.splash_runtime import supports_reasoning_effort
+                    aliases = {}
+                    fields, body = responses_api.envelope(body), responses_api.to_chat_request(
+                        body, allow_images=allow_images, aliases=aliases,
+                        allow_reasoning_effort=runtime == "splash" and supports_reasoning_effort(
+                            self.server.config.get("splash_version")))
                 except responses_api.ResponsesRequestError as error:
                     raise GatewayError(400, "invalid_request", str(error))
             elif self.path not in ("/v1/chat/completions", "/v1/completions"):
@@ -1246,7 +1291,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens <= 0:
                 raise GatewayError(400, "invalid_body", "max_tokens must be a positive integer.")
             body["max_tokens"] = min(tokens, self.server.config["max_tokens"])
-            runtime = self.server.config.get("runtime")
             # Splash answers only to its served name.
             body["model"] = self.server.config["splash_served_model" if runtime == "splash" else "local_path"]
             # Existing receipts predate the runtime field; recognize only the
@@ -1290,11 +1334,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if self.path == "/v1/responses":
                 if body.get("stream"):
                     response_started = True
-                    stream = responses_api.ResponseStream(requested, fields)
+                    stream = responses_api.ResponseStream(requested, fields, aliases)
                     self._stream(response, stream)
                     result = stream.response
                 else:
-                    result = self._relay(response, lambda value: responses_api.from_chat_response(trimmed(value), requested, fields))
+                    result = self._relay(response, lambda value: responses_api.from_chat_response(trimmed(value), requested, fields, aliases))
                 if fields["store"]:
                     self.server.remember(result)
                 return
@@ -1384,7 +1428,24 @@ def main():
     config = json.loads(path.read_text())
     if args.model != config["model"]:
         raise ValueError("JIT configuration identity changed.")
-    server = make_server(config, args.port)
+    from mlx_agent.model_serving import adopt_gateway
+    config["port"] = args.port
+    claim = adopt_gateway(config)
+    server = None
+    try:
+        server = make_server(config, args.port)
+        server.controller._persist()
+    except BaseException as failure:
+        if server is not None:
+            server.server_close()
+        try:
+            claim.cancel_unstarted_gateway()
+        except Exception as cleanup_error:
+            failure.add_note('Model ownership cleanup failed: ' + str(cleanup_error))
+        raise
+    if not config.get("model_serving_claim"):
+        from mlx_agent.model_serving import mark_foreground_ready
+        mark_foreground_ready(claim)
     if config.get("runtime") == "strata":
         if os.getpgrp() != os.getpid() or os.getsid(0) != os.getpid():
             server.server_close()
@@ -1397,6 +1458,7 @@ def main():
     finally:
         server.controller.close()
         server.server_close()
+        claim.release()
 
 
 if __name__ == "__main__":

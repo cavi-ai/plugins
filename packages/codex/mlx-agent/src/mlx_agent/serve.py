@@ -29,7 +29,7 @@ from pathlib import Path
 from .identity_pass import recheck_bound_identity
 from .model_doctor import scan_wired_configs
 from .serving_plan import preview_hash, receipt_fields
-from .transactions import _atomic_in_directory
+from .transactions import _atomic_in_directory, _target_locks
 from .wiring import require_secret_free_config, validate_health_endpoint
 
 
@@ -48,10 +48,11 @@ _RECIPES_PATH = Path(__file__).resolve().parent / "resources" / "serve-recipes.j
 class ServeError(RuntimeError):
     """Classified serve failure safe to surface in a result envelope."""
 
-    def __init__(self, code, message, remediation):
+    def __init__(self, code, message, remediation, data=None):
         super().__init__(message)
         self.code = code
         self.remediation = remediation
+        self.data = data or {}
 
 
 def load_recipes(path=None):
@@ -205,12 +206,24 @@ def plan_start(repo, runtime, recipes, port=None, max_tokens=MAX_TOKENS_DEFAULT,
                runtime_executable=None, strata_speculation=False, strata_decoding=None,
                strata_expert_memory_gb=None, strata_context_tokens=None, training_receipt=None, thinking="default",
                m5_prefill=False, prompt_lookup=False, vision_cache=False, api_key_file=None, api_key_sha256=None,
-               system_prompt=None, default_temperature=None, default_top_p=None,
-               splash_draft_model=None, splash_max_memory_gb=None, splash_max_context_tokens=None):
+               system_prompt=None, default_temperature=None, default_top_p=None, shared_prefix_cache_mib=None,
+               splash_draft_model=None, splash_max_memory_gb=None, splash_max_context_tokens=None,
+               splash_tuning=None, splash_chat_template=None):
     """Render the start plan and local file identities without side effects."""
+    splash_tuning = {key: value for key, value in (splash_tuning or {}).items() if value is not None}
     if runtime != "splash" and (splash_draft_model is not None or splash_max_memory_gb is not None
-                                or splash_max_context_tokens is not None):
+                                or splash_max_context_tokens is not None or splash_tuning
+                                or splash_chat_template is not None):
         raise ServeError("invalid_arguments", "Splash options require the Splash runtime.", "Use --runtime splash.")
+    if thinking == "off" and "splash_reasoning_effort" in splash_tuning:
+        raise ServeError("invalid_arguments", "Splash refuses a reasoning effort together with --thinking off.",
+                         "Use --splash-reasoning-effort none instead of --thinking off.")
+    if shared_prefix_cache_mib is not None:
+        if (type(shared_prefix_cache_mib) is not int or not 16 <= shared_prefix_cache_mib <= 2048
+                or runtime != "mlx_lm" or not jit or api_key_file is None or m5_prefill or prompt_lookup
+                or vision_cache or system_prompt is not None or adapter_path is not None or training_receipt is not None):
+            raise ServeError("invalid_arguments", "Shared prefixes require a keyed MLX-LM JIT endpoint and a 16–2048 MiB budget.",
+                             "Use an API key file and remove incompatible runtime options.")
     access = None
     if api_key_file is not None:
         if api_key_sha256 is not None:
@@ -344,6 +357,11 @@ def plan_start(repo, runtime, recipes, port=None, max_tokens=MAX_TOKENS_DEFAULT,
         "max_tokens": str(max_tokens),
         "runtime_adapter": str(Path(__file__).with_name("strata_runtime.py").resolve()),
     }
+    if shared_prefix_cache_mib is not None:
+        resolved = shutil.which(values['executable'])
+        if resolved is None:
+            raise ServeError('runtime_not_installed', 'The MLX-LM runtime is unavailable.', 'Install a supported runtime.')
+        values['executable'] = str(Path(resolved).resolve())
     contribution = None
     if runtime != "strata" and (strata_expert_memory_gb is not None or strata_context_tokens is not None or strata_decoding is not None):
         raise ServeError("invalid_arguments", "Strata memory controls require the Strata runtime.",
@@ -359,7 +377,8 @@ def plan_start(repo, runtime, recipes, port=None, max_tokens=MAX_TOKENS_DEFAULT,
         from .splash_runtime import SplashError, plan_contribution
         try:
             contribution = plan_contribution(local_path, has_repo, repo, hf_cache, adapter_path, jit, runtime_executable,
-                                             splash_draft_model, splash_max_memory_gb, splash_max_context_tokens)
+                                             splash_draft_model, splash_max_memory_gb, splash_max_context_tokens,
+                                             splash_tuning, splash_chat_template)
         except SplashError as error:
             raise ServeError(error.code, str(error), error.remediation) from error
     if contribution is not None:
@@ -417,6 +436,15 @@ def plan_start(repo, runtime, recipes, port=None, max_tokens=MAX_TOKENS_DEFAULT,
         "readiness": recipe["readiness"].format(port=selected_port),
         "bind": "127.0.0.1",
     }
+    if shared_prefix_cache_mib is not None:
+        from .private_serve import runtime_python
+        from .shared_prefix_cache import identity as prefix_identity
+        try:
+            plan['shared_prefix_cache'] = {'mib': shared_prefix_cache_mib,
+                                           'runtime': prefix_identity(runtime_python(values['executable']))}
+        except (OSError, ValueError, subprocess.SubprocessError, KeyError) as error:
+            raise ServeError('unsupported_runtime', 'Shared prefixes require the supported MLX-LM build.',
+                             'Use the reviewed runtime or omit the shared prefix option.') from error
     if contribution is not None:
         contribution.apply_fields(plan)
     elif has_path:
@@ -570,7 +598,7 @@ def start_serve(plan, receipts_dir=None, confirm=False, preview_hash=None,
                 which=None, model_present=None, path_present=None, port_free=None,
                 wired_claims=None, spawn=None, readiness=None,
                 readiness_deadline=READINESS_DEADLINE_DEFAULT, now=_utc_now,
-                pid_alive=None):
+                pid_alive=None, hf_cache=None):
     """Execute a reviewed start plan; the only mutating serve entry point."""
     which = which or _default_which
     port_free = port_free or _default_port_free
@@ -596,120 +624,155 @@ def start_serve(plan, receipts_dir=None, confirm=False, preview_hash=None,
         )
     recheck_bound_identity(plan)
 
-    if plan["runtime"] == "strata" and not plan.get("jit"):
-        from .jit_serve import available_memory_bytes
-        available = available_memory_bytes()
-        required = plan["strata_memory_estimate_bytes"] + 2_000_000_000
-        if type(available) is not int or available < 0:
-            raise ServeError("memory_unknown", "Available memory could not be measured.",
-                             "Retry after memory reporting is available.")
-        if available < required:
-            raise ServeError("insufficient_headroom", "Insufficient memory for the reviewed Strata settings and 2 GB reserve.",
-                             "Reduce the expert budget or context capacity, or free memory.")
+    from .model_serving import acquire, resolve_model, ModelServingError
+    try:
+        selector = plan.get("local_path") or plan.get("splash_model_dir") or plan.get("path") or plan.get("repo")
+        model = resolve_model(selector, hf_cache)
+        service = {"port": plan["port"], "runtime": plan["runtime"],
+                   "auth_required": bool(plan.get("api_key_sha256") or plan.get("access_key_file"))}
+        claim = acquire(model, kind="service", service=service)
+    except ModelServingError as error:
+        raise ServeError(error.code, str(error), error.remediation, error.data) from error
+    except (OSError, ValueError, TypeError, RuntimeError):
+        raise ServeError("model_serving_state_unknown", "The local model identity is unavailable.",
+                         "Inspect the model and retry with its existing local path.") from None
+    try:
+        if plan["runtime"] == "strata" and not plan.get("jit"):
+            from .jit_serve import available_memory_bytes
+            available = available_memory_bytes()
+            required = plan["strata_memory_estimate_bytes"] + 2_000_000_000
+            if type(available) is not int or available < 0:
+                raise ServeError("memory_unknown", "Available memory could not be measured.",
+                                 "Retry after memory reporting is available.")
+            if available < required:
+                raise ServeError("insufficient_headroom", "Insufficient memory for the reviewed Strata settings and 2 GB reserve.",
+                                 "Reduce the expert budget or context capacity, or free memory.")
 
-    if which(plan["argv"][0]) is None:
-        recipe_hint = load_recipes()[plan["runtime"]]["install_hint"]
-        raise ServeError(
-            "runtime_not_installed",
-            "The {0} executable is not installed.".format(plan["argv"][0]),
-            "Install it yourself ({0}); serve never installs runtimes.".format(recipe_hint),
-        )
-    if plan.get("jit"):
-        if which(plan["worker_argv"][0]) is None:
-            raise ServeError("runtime_not_installed", "The model worker executable is not installed.",
-                             load_recipes()[plan["runtime"]]["install_hint"])
-    if plan["repo"] is not None and model_present is not None and not model_present(plan["repo"]):
-        raise ServeError(
-            "model_not_local",
-            "The model is not present in a local inventory.",
-            "Download it with the runtime's own pull command first; serve never downloads models.",
-        )
-    # A Splash target may be a GGUF file; its identity check above proved it present.
-    if plan["path"] is not None and plan["runtime"] != "splash":
-        present = path_present or _default_path_present
-        if not present(plan["path"]):
+        if which(plan["argv"][0]) is None:
+            recipe_hint = load_recipes()[plan["runtime"]]["install_hint"]
+            raise ServeError(
+                "runtime_not_installed",
+                "The {0} executable is not installed.".format(plan["argv"][0]),
+                "Install it yourself ({0}); serve never installs runtimes.".format(recipe_hint),
+            )
+        if plan.get("jit"):
+            if which(plan["worker_argv"][0]) is None:
+                raise ServeError("runtime_not_installed", "The model worker executable is not installed.",
+                                 load_recipes()[plan["runtime"]]["install_hint"])
+        if plan["repo"] is not None and model_present is not None and not model_present(plan["repo"]):
             raise ServeError(
                 "model_not_local",
-                "The model directory is not present: {0}".format(plan["path"]),
-                "Point --path at an existing local model directory; serve never downloads models.",
+                "The model is not present in a local inventory.",
+                "Download it with the runtime's own pull command first; serve never downloads models.",
             )
-    if not port_free(plan["port"]):
-        raise ServeError(
-            "port_in_use",
-            "Port {0} is already bound on 127.0.0.1.".format(plan["port"]),
-            "Pick a free --port, or stop the process that owns this one.",
-        )
-    if wired_claims is not None:
-        claimed = wired_claims(plan["port"], plan["runtime"])
-        if claimed:
+        # A Splash target may be a GGUF file; its identity check above proved it present.
+        if plan["path"] is not None and plan["runtime"] != "splash":
+            present = path_present or _default_path_present
+            if not present(plan["path"]):
+                raise ServeError(
+                    "model_not_local",
+                    "The model directory is not present: {0}".format(plan["path"]),
+                    "Point --path at an existing local model directory; serve never downloads models.",
+                )
+        if not port_free(plan["port"]):
             raise ServeError(
                 "port_in_use",
-                "A wired config already claims port {0}.".format(plan["port"]),
-                "Move this server to its own --port.",
+                "Port {0} is already bound on 127.0.0.1.".format(plan["port"]),
+                "Pick a free --port, or stop the process that owns this one.",
             )
-    receipt_path = root / "{0}.json".format(plan["port"])
-    if receipt_path.exists():
-        existing = _read_receipt(receipt_path)
-        if existing is not None and (pid_alive(existing.get("pid", -1)) or _owned_jit_worker(existing, root)):
-            raise ServeError(
-                "port_in_use",
-                "A serve receipt for port {0} is still live.".format(plan["port"]),
-                "Run serve stop --port {0} first.".format(plan["port"]),
-            )
+        if wired_claims is not None:
+            claimed = wired_claims(plan["port"], plan["runtime"])
+            if claimed:
+                raise ServeError(
+                    "port_in_use",
+                    "A wired config already claims port {0}.".format(plan["port"]),
+                    "Move this server to its own --port.",
+                )
+        receipt_path = root / "{0}.json".format(plan["port"])
+        if receipt_path.exists():
+            existing = _read_receipt(receipt_path)
+            if existing is not None and (pid_alive(existing.get("pid", -1)) or _owned_jit_worker(existing, root)):
+                raise ServeError(
+                    "port_in_use",
+                    "A serve receipt for port {0} is still live.".format(plan["port"]),
+                    "Run serve stop --port {0} first.".format(plan["port"]),
+                )
 
-    root.mkdir(parents=True, exist_ok=True)
-    if spawn is _default_spawn:
-        from .service_registry import register_receipts
-        register_receipts(root.absolute().parent.parent)
-    log_path = root / "{0}.log".format(plan["port"])
-    if plan.get("jit"):
-        config_path = Path(plan["control_config"])
-        if config_path.parent != root.absolute() or config_path.is_symlink():
-            raise ServeError("invalid_arguments", "Unsafe JIT configuration path.", "Review a fresh serve plan.")
-        from .worker_transport import gateway_config
-        config = gateway_config(plan, control_token=secrets.token_hex(32),
-                                state_path=str(root.absolute() / "{}.jit-state.json".format(plan["port"])),
-                                log_path=root.absolute() / "{}.worker.log".format(plan["port"]),
-                                config_path=config_path,
-                                task_state_dir=str(root.absolute().parent / "tasks" / str(plan["port"])))
-        _atomic_in_directory(root, config_path.name, json.dumps(config).encode(), 0o600)
-        if plan.get("api_key_sha256") is not None:
-            readiness_headers["Authorization"] = "Bearer " + config["control_token"]
-    pid = spawn(plan["argv"], str(log_path))
-    if not readiness(plan["readiness"], plan.get("readiness_deadline", readiness_deadline)):
-        _terminate_pid(pid)
-        raise ServeError(
-            "readiness_timeout",
-            "The server did not answer its readiness endpoint in time.",
-            "Inspect the serve log at {0}.".format(log_path),
-        )
-    try:
-        recheck_bound_identity(plan)
-    except ServeError:
-        _terminate_pid(pid)
+        root.mkdir(parents=True, exist_ok=True)
+        if spawn is _default_spawn:
+            from .service_registry import register_receipts
+            register_receipts(root.absolute().parent.parent)
+        log_path = root / "{0}.log".format(plan["port"])
+        if plan.get("jit"):
+            config_path = Path(plan["control_config"])
+            if config_path.parent != root.absolute() or config_path.is_symlink():
+                raise ServeError("invalid_arguments", "Unsafe JIT configuration path.", "Review a fresh serve plan.")
+            from .worker_transport import gateway_config
+            config = gateway_config(plan, control_token=secrets.token_hex(32),
+                                    state_path=str(root.absolute() / "{}.jit-state.json".format(plan["port"])),
+                                    log_path=root.absolute() / "{}.worker.log".format(plan["port"]),
+                                    config_path=config_path,
+                                    task_state_dir=str(root.absolute().parent / "tasks" / str(plan["port"])))
+            config["port"] = plan["port"]
+            config["model_serving_claim"] = {"key": claim.key, "generation": claim.generation}
+            _atomic_in_directory(root, config_path.name, json.dumps(config).encode(), 0o600)
+            if plan.get("api_key_sha256") is not None:
+                readiness_headers["Authorization"] = "Bearer " + config["control_token"]
+        claim.update(state="launching", state_path=str(root.absolute() / "{}.jit-state.json".format(plan["port"])) if plan.get("jit") else None)
+        pid = spawn(plan["argv"], str(log_path))
+        from .compute import process_birth_identity
+        birth = process_birth_identity(pid)
+        if not birth:
+            raise ServeError("model_serving_state_unknown", "The launched process identity is unavailable.",
+                             "Inspect the model service and its owned processes before retrying.")
+        claim.update(state="active", pid=pid, birth=birth, pgid=pid, jit=bool(plan.get("jit")))
+        if not readiness(plan["readiness"], plan.get("readiness_deadline", readiness_deadline)):
+            _terminate_pid(pid)
+            raise ServeError(
+                "readiness_timeout",
+                "The server did not answer its readiness endpoint in time.",
+                "Inspect the serve log at {0}.".format(log_path),
+            )
+        try:
+            recheck_bound_identity(plan)
+        except ServeError:
+            _terminate_pid(pid)
+            raise
+
+        receipt = {
+            "schema_version": SERVE_RECEIPT_SCHEMA_VERSION,
+            "kind": SERVE_RECEIPT_KIND,
+            "repo": plan["repo"],
+            "path": plan["path"],
+            "runtime": plan["runtime"],
+            "port": plan["port"],
+            "argv": list(plan["argv"]),
+            "pid": pid,
+            "log_path": str(log_path),
+            "readiness": plan["readiness"],
+            "started_at": now(),
+            "preview_hash": plan["preview_hash"],
+            "model_artifact": model,
+        }
+        process_start = _pid_start(pid)
+        if process_start:
+            receipt["process_started_at"] = process_start
+        receipt.update(receipt_fields(plan))
+        content = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        with _target_locks([receipt_path], blocking=True):
+            _atomic_in_directory(root, receipt_path.name, content, 0o600)
+        claim.update(ready=True, receipt_path=str(receipt_path.absolute()))
+        return {"status": "started", "receipt": receipt}
+
+    except BaseException as failure:
+        # Only an unstarted reservation can be cancelled without process proof.
+        try:
+            claim.cancel_reserved()
+        except ModelServingError as error:
+            raise ServeError(error.code, str(error), error.remediation, error.data) from error
+        if isinstance(failure, ModelServingError):
+            raise ServeError(failure.code, str(failure), failure.remediation, failure.data) from failure
         raise
-
-    receipt = {
-        "schema_version": SERVE_RECEIPT_SCHEMA_VERSION,
-        "kind": SERVE_RECEIPT_KIND,
-        "repo": plan["repo"],
-        "path": plan["path"],
-        "runtime": plan["runtime"],
-        "port": plan["port"],
-        "argv": list(plan["argv"]),
-        "pid": pid,
-        "log_path": str(log_path),
-        "readiness": plan["readiness"],
-        "started_at": now(),
-        "preview_hash": plan["preview_hash"],
-    }
-    process_start = _pid_start(pid)
-    if process_start:
-        receipt["process_started_at"] = process_start
-    receipt.update(receipt_fields(plan))
-    content = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-    _atomic_in_directory(root, receipt_path.name, content, 0o600)
-    return {"status": "started", "receipt": receipt}
 
 
 def _read_receipt(path):
@@ -876,14 +939,16 @@ def _jit_config(receipt, root):
 def _jit_control(receipt, root, action, policy=None, timeout=None):
     config = _jit_config(receipt, root)
     request = urllib.request.Request("http://127.0.0.1:{}/_mlx/{}".format(receipt["port"], action),
-        data=json.dumps(policy or {}).encode() if action in ("unload", "policy", "cache") else None,
+        data=json.dumps(policy or {}).encode() if action in ("unload", "policy", "cache", "idle-stop") else None,
         headers={"Authorization": "Bearer " + config["control_token"], "Content-Type": "application/json"})
     from .inference_auth import loopback_opener
     opener = loopback_opener()
     try:
         with opener.open(request, timeout=timeout if timeout is not None else (15 if action in ("unload", "policy", "cache") else 2)) as response:
             state = json.load(response)
-            if not isinstance(state, dict) or state.get("model_state") not in ("loaded", "unloaded", "loading", "unloading", "failed"):
+            if not isinstance(state, dict):
+                raise ValueError("Invalid control response.")
+            if action != "idle-stop" and state.get("model_state") not in ("loaded", "unloaded", "loading", "unloading", "failed"):
                 raise ValueError("Invalid model residency status.")
             return state
     except urllib.error.HTTPError as error:
@@ -970,8 +1035,10 @@ def _configure_owned_jit(port, receipts_dir, expected_pid, action, policy=None, 
 
 
 def stop_serve(port, receipts_dir=None, pid_alive=_pid_alive, pid_command=_pid_command,
-               terminate=_terminate_pid, clock=time.monotonic, sleep=time.sleep, expected_pid=None, expected_start=None):
+               terminate=_terminate_pid, clock=time.monotonic, sleep=time.sleep, expected_pid=None, expected_start=None, if_idle=False):
     """Stop exactly the process a serve receipt owns; never kills by port scan."""
+    if if_idle and (type(expected_pid) is not int or expected_pid <= 0 or not isinstance(expected_start, str) or not expected_start):
+        raise ServeError("invalid_arguments", "Idle stop requires the exact process identity.", "Refresh serving status and retry.")
     root = receipts_root(receipts_dir)
     receipt_path = root / "{0}.json".format(port)
     receipt = _read_receipt(receipt_path) if receipt_path.is_file() else None
@@ -985,10 +1052,18 @@ def stop_serve(port, receipts_dir=None, pid_alive=_pid_alive, pid_command=_pid_c
     if (expected_pid is not None and pid != expected_pid) or (expected_start is not None and _pid_start(pid) != expected_start):
         raise ServeError("server_changed", "The selected serving process changed; nothing was stopped.",
                          "Refresh serving status and review the current service.")
-    orphan = _owned_jit_worker(receipt, root) if not pid_alive(pid) else None
+    if if_idle and receipt.get("process_started_at") != expected_start:
+        raise ServeError("server_changed", "The selected serving receipt has a different process identity.", "Refresh serving status.")
+    if if_idle and (not receipt.get("jit") or receipt.get("runtime") != "splash"):
+        raise ServeError("unsupported_runtime", "Idle stop requires a Splash JIT endpoint.", "Refresh serving status.")
+    if if_idle and not pid_alive(pid):
+        raise ServeError("server_changed", "The selected gateway is no longer running.", "Refresh serving status.")
+    orphan = _owned_jit_worker(receipt, root) if not if_idle and not pid_alive(pid) else None
     if orphan:
         pid = orphan
-    if not pid_alive(pid):
+    if not if_idle and not pid_alive(pid):
+        from .model_serving import release_stopped_service
+        release_stopped_service(receipt)
         receipt_path.unlink()
         return {"status": "already_stopped", "port": port, "pid": pid}
     command = pid_command(pid)
@@ -998,6 +1073,23 @@ def stop_serve(port, receipts_dir=None, pid_alive=_pid_alive, pid_command=_pid_c
             "The live pid {0} does not match the serve receipt; refusing to signal it.".format(pid),
             "Inspect the process yourself; the receipt is retained at {0}.".format(receipt_path),
         )
+    if if_idle:
+        reply = _jit_control(receipt, root, "idle-stop", {"pid": expected_pid, "process_started_at": expected_start})
+        if (set(reply) != {"accepted", "pid", "process_started_at"} or reply["accepted"] is not True
+                or type(reply["pid"]) is not int or reply["pid"] != expected_pid or reply["process_started_at"] != expected_start):
+            raise ServeError("server_changed", "The endpoint did not confirm its identity.", "Refresh serving status and retry.")
+        deadline = clock() + SPLASH_STOP_DEADLINE_SECONDS
+        while clock() < deadline:
+            if not pid_alive(pid):
+                from .model_serving import release_stopped_service
+                release_stopped_service(receipt)
+                with _target_locks([receipt_path], blocking=True):
+                    if _read_receipt(receipt_path) != receipt:
+                        raise ServeError("server_changed", "The serving receipt changed during shutdown.", "Refresh serving status.")
+                    receipt_path.unlink()
+                return {"status": "stopped", "port": port, "pid": pid}
+            sleep(0.2)
+        raise ServeError("stop_failed", "The idle endpoint did not finish stopping.", "Refresh serving status before retrying.")
     if (receipt.get("jit") or receipt.get("runtime") in ("strata", "splash")) and terminate is _terminate_pid and os.getpgid(pid) == receipt["pid"]:
         terminate = lambda _pid, sig: os.killpg(receipt["pid"], sig)
     terminate(pid, signal.SIGTERM)
@@ -1005,6 +1097,8 @@ def stop_serve(port, receipts_dir=None, pid_alive=_pid_alive, pid_command=_pid_c
     deadline = clock() + (SPLASH_STOP_DEADLINE_SECONDS if receipt.get("runtime") == "splash" else STOP_DEADLINE_SECONDS)
     while clock() < deadline:
         if not pid_alive(pid):
+            from .model_serving import release_stopped_service
+            release_stopped_service(receipt)
             receipt_path.unlink()
             return {"status": "stopped", "port": port, "pid": pid}
         sleep(0.2)
@@ -1015,6 +1109,8 @@ def stop_serve(port, receipts_dir=None, pid_alive=_pid_alive, pid_command=_pid_c
             "The process did not exit after SIGTERM and SIGKILL.",
             "Inspect pid {0} yourself; the receipt is retained at {1}.".format(pid, receipt_path),
         )
+    from .model_serving import release_stopped_service
+    release_stopped_service(receipt)
     receipt_path.unlink()
     return {"status": "stopped", "port": port, "pid": pid, "forced": True}
 
@@ -1064,14 +1160,26 @@ def launchd_label(port):
     return "{0}{1}".format(LAUNCHD_LABEL_PREFIX, port)
 
 
-def render_launchd_plist(plan, log_path=None):
+def render_launchd_plist(plan, log_path=None, hf_cache=None):
     """Render a deterministic launchd plist for a reviewed serve plan."""
     from xml.sax.saxutils import escape
 
     label = launchd_label(plan["port"])
     log = log_path or str(receipts_root() / "{0}.log".format(plan["port"]))
+    from .model_serving import resolve_model
+    try:
+        artifact = resolve_model(plan.get("local_path") or plan.get("splash_model_dir") or plan.get("path") or plan.get("repo"), hf_cache)
+    except (OSError, ValueError, RuntimeError, TypeError):
+        raise ServeError("model_serving_state_unknown", "The local model identity is unavailable.",
+                         "Select existing local model files and review the launch again.") from None
+    wrapper = [sys.executable, str(Path(__file__).with_name("model_serving_entry.py").resolve()),
+               "--artifact", artifact, "--runtime", plan["runtime"], "--port", str(plan["port"]),
+               "--auth-required", "true" if plan.get("api_key_sha256") else "false"]
+    if hf_cache is not None:
+        wrapper.extend(["--hf-cache", str(hf_cache)])
+    wrapper.extend(["--", *plan["argv"]])
     arguments = "\n".join(
-        "        <string>{0}</string>".format(escape(str(part))) for part in plan["argv"]
+        "        <string>{0}</string>".format(escape(str(part))) for part in wrapper
     )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
