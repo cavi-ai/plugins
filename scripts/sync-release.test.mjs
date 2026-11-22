@@ -128,8 +128,7 @@ test("rejects source revision and git-subdirectory drift", async () => {
   claude.plugins.find((p) => p.name === "secure-agent").source.path = ".";
   await writeFile(path.join(root, ".claude-plugin/marketplace.json"), JSON.stringify(claude));
   const errors = await validateCatalog(root);
-  assert(errors.includes("codex package does not match its release pin: agent-sessions"));
-  assert(errors.includes("claude source does not match its release pin: agent-sessions"));
+  assert(errors.includes("catalog revision does not match its release pin: agent-sessions"));
   assert(errors.includes("claude source does not match its release pin: secure-agent"));
 });
 

@@ -56,7 +56,7 @@
   },
   "agent-sessions": {
     "repository": "cavi-ai/agent-sessions",
-    "source_commit": "763eeb10d315b6c8bf40b95cbebd0df7d9aff0d1",
+    "source_commit": "7d2fe18889bb0409acf3129dd2d833534b1fed33",
     "source_path": ".",
     "tree": "d221fe11cb43c8a4e3e9ba462c95911d373e4a503f717d21b5b9c3db32962ec4",
     "skills": [

@@ -1,6 +1,6 @@
 {
   "repository": "cavi-ai/agent-sessions",
-  "source_commit": "763eeb10d315b6c8bf40b95cbebd0df7d9aff0d1",
+  "source_commit": "7d2fe18889bb0409acf3129dd2d833534b1fed33",
   "source_path": ".",
   "included": [
     ".codex-plugin",
