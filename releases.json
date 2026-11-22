@@ -6,5 +6,9 @@
   "obsidian-agent": {
     "tag": "v0.1.0",
     "commit": "b0b0cf03658b4f74c632db54834cb9add337c40a"
+  },
+  "agent-sessions": {
+    "tag": "v0.3.0",
+    "commit": "7d2fe18889bb0409acf3129dd2d833534b1fed33"
   }
 }

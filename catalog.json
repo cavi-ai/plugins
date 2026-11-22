@@ -46,7 +46,7 @@
       "repository": "cavi-ai/agent-sessions",
       "license": "MIT",
       "summary": "Coordinate specialized agent workers with focused context and queued handoffs.",
-      "revision": "763eeb10d315b6c8bf40b95cbebd0df7d9aff0d1",
+      "revision": "7d2fe18889bb0409acf3129dd2d833534b1fed33",
       "hosts": ["claude", "codex"],
       "packages": {
         "claude": { "path": "." },

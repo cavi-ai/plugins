@@ -41,7 +41,8 @@
       "source": {
         "source": "github",
         "repo": "cavi-ai/agent-sessions",
-        "sha": "763eeb10d315b6c8bf40b95cbebd0df7d9aff0d1"
+        "ref": "v0.3.0",
+        "sha": "7d2fe18889bb0409acf3129dd2d833534b1fed33"
       },
       "description": "Coordinate specialized agent workers with focused context and queued handoffs."
     },
