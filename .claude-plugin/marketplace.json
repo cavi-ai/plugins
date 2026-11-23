@@ -23,8 +23,8 @@
       "source": {
         "source": "github",
         "repo": "cavi-ai/obsidian-agent",
-        "ref": "v0.1.0",
-        "sha": "b0b0cf03658b4f74c632db54834cb9add337c40a"
+        "ref": "v0.3.0",
+        "sha": "de463fc6c3a080647b489c7ea57171924aa331f4"
       },
       "description": "Portable Obsidian vault workflows powered by the official Obsidian CLI."
     },

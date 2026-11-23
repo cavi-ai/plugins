@@ -16,7 +16,7 @@
       "repository": "cavi-ai/obsidian-agent",
       "package": "providers/opencode",
       "install": {
-        "command": "git clone --branch v0.1.0 --depth 1 https://github.com/cavi-ai/obsidian-agent.git && node obsidian-agent/scripts/install.mjs --host opencode --scope user --dry-run"
+        "command": "git clone --branch v0.3.0 --depth 1 https://github.com/cavi-ai/obsidian-agent.git && node obsidian-agent/scripts/install.mjs --host opencode --scope user --dry-run"
       }
     }
   ]
