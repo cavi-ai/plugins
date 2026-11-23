@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import wave
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from pathlib import Path
 from . import task_kinds
 from .backends import BackendError, load_manifests
 from .compute import ComputeBusy, ComputeLease, group_members, process_alive, process_identity
+from .process_table import identities
 from .inference_runner import InferenceError
 from .task_contracts import MAX_REQUEST_BYTES, TERMINAL, TaskError, validate_request
 from .task_identity import capture_identity, check_identity
@@ -45,9 +47,12 @@ def _spawn(role, identifier, store, launcher=subprocess.Popen):
     environment["PYTHONPATH"] = source + (os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else "")
     try:
         with os.fdopen(descriptor, "wb") as output:
-            return launcher([sys.executable, "-m", "mlx_agent.task_worker", "--role", role, "--id", identifier,
-                             "--state-dir", str(store.root)], stdin=subprocess.DEVNULL, stdout=output,
-                            stderr=subprocess.STDOUT, start_new_session=True, env=environment, umask=0o077)
+            process = launcher([sys.executable, "-m", "mlx_agent.task_worker", "--role", role, "--id", identifier,
+                                "--state-dir", str(store.root)], stdin=subprocess.DEVNULL, stdout=output,
+                               stderr=subprocess.STDOUT, start_new_session=True, env=environment, umask=0o077)
+        if isinstance(process, subprocess.Popen):
+            threading.Thread(target=process.wait, name="mlx-task-reaper", daemon=True).start()
+        return process
     except OSError as error:
         raise TaskError("task_launch_failed", "Cannot launch the task worker: {0}".format(error)) from error
 
@@ -206,9 +211,10 @@ def _artifact_reference(path):
 
 def _known_members(process, identity, previous):
     members = group_members(process.pid)
-    if process_identity(process.pid) == identity:
-        return {pid: observed for pid in members if (observed := process_identity(pid))}
-    return {pid: value for pid, value in previous.items() if pid in members and process_identity(pid) == value}
+    observed = identities(set(members) | {process.pid})
+    if observed.get(process.pid) == identity:
+        return {pid: value for pid in members if (value := observed.get(pid))}
+    return {pid: value for pid, value in previous.items() if pid in members and observed.get(pid) == value}
 
 
 def _wait_for_execution_ready(process, store, identifier):
@@ -296,8 +302,7 @@ def supervise(identifier, state_dir, lease_factory=ComputeLease):
             store.transition(identifier, ("starting",), {"state": "running", "execution": {"pid": process.pid, "identity": identity}})
             while process.poll() is None:
                 known = _known_members(process, identity, known)
-                record = store.get(identifier)
-                if record["cancel_requested"]:
+                if store.cancel_requested(identifier):
                     stopped = _stop(process, identity, known)
                     _finish(store, identifier, "cancelled" if stopped else "failed", execution_unresolved=not stopped,
                             error=None if stopped else _error(TaskError("task_stop_unconfirmed", "The task execution group could not be stopped safely.")))
@@ -322,7 +327,7 @@ def supervise(identifier, state_dir, lease_factory=ComputeLease):
             store.read_request(identifier)
             result = store.write_result(identifier, outcome["result"])
             # Re-read cancellation at the last publication boundary.
-            if store.get(identifier)["cancel_requested"]:
+            if store.cancel_requested(identifier):
                 _finish(store, identifier, "cancelled")
             else:
                 _finish(store, identifier, "succeeded", result=result, error=None)
