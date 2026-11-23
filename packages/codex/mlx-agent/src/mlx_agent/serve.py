@@ -350,6 +350,11 @@ def plan_start(repo, runtime, recipes, port=None, max_tokens=MAX_TOKENS_DEFAULT,
     if adapter_path is not None:
         adapter_path, adapter_identity = _adapter_evidence(adapter_path)
     model_value = repo.strip() if has_repo else local_path
+    if runtime == "mlx-vlm" and has_repo and not jit:
+        from .convert import cached_snapshot
+        snapshot = cached_snapshot(model_value, hf_cache)
+        if snapshot is not None:
+            model_value = str(snapshot.absolute())
     values = {
         "executable": runtime_executable or recipe["executable"],
         "repo": model_value,
@@ -801,6 +806,50 @@ def _read_receipt(path):
     return value
 
 
+def routing_receipts(receipts_dir, deadline):
+    """Read enough verified receipt data to route requests without polling model status."""
+    from .process_table import identities
+
+    root = receipts_root(receipts_dir)
+    receipts = []
+    try:
+        with os.scandir(root) as directory:
+            for index, entry in enumerate(directory):
+                if index >= MAX_RECEIPTS * 8:
+                    raise ValueError("Service receipt directory exceeds the routing scan limit.")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Service routing discovery timed out.")
+                if not re.fullmatch(r"[0-9]{1,5}\.json", entry.name):
+                    continue
+                receipt = _read_receipt(root / entry.name)
+                if (receipt is not None and receipt["pid"] > 0
+                        and entry.name == f'{receipt["port"]}.json'
+                        and (receipt.get("jit") or receipt.get("runtime") == "tasks")):
+                    receipts.append(receipt)
+                    if len(receipts) > MAX_RECEIPTS:
+                        raise ValueError("Service routing receipt limit reached.")
+    except FileNotFoundError:
+        return []
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Service routing discovery timed out.")
+    observed = identities((receipt["pid"] for receipt in receipts if _pid_alive(receipt["pid"])),
+                          timeout=min(5, remaining), env=dict(os.environ, LC_ALL="C"))
+    routes = []
+    for receipt in receipts:
+        identity = observed.get(receipt["pid"], "").split(None, 5)
+        if len(identity) != 6:
+            continue
+        birth = " ".join(identity[:5])
+        expected = receipt.get("process_started_at")
+        if (expected is not None and (not isinstance(expected, str) or birth != " ".join(expected.split()))
+                or not _argv_matches(receipt, identity[5])):
+            continue
+        routes.append(dict(receipt, alive=True, argv_match=True))
+    return routes
+
+
 def status_serve(receipts_dir=None, pid_alive=_pid_alive, pid_command=_pid_command, deadline=None, errors=None):
     """Cross-check serve receipts against live processes; read-only."""
     root = receipts_root(receipts_dir)
@@ -910,7 +959,7 @@ def _argv_matches(receipt, command, require_port=True):
         if "--config" not in argv or str(argv[argv.index("--config") + 1]) not in command:
             return False
     if require_port:
-        return "--port {0}".format(receipt.get("port")) in command
+        return "--port {0} ".format(receipt.get("port")) in command + " "
     return True
 
 
