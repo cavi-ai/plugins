@@ -4,8 +4,8 @@
     "commit": "c1c419b60014933e3c3cd94be746be6de4c5577b"
   },
   "obsidian-agent": {
-    "tag": "v0.1.0",
-    "commit": "b0b0cf03658b4f74c632db54834cb9add337c40a"
+    "tag": "v0.3.0",
+    "commit": "de463fc6c3a080647b489c7ea57171924aa331f4"
   },
   "agent-sessions": {
     "tag": "v0.3.0",
