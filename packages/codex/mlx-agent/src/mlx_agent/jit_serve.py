@@ -529,6 +529,12 @@ class ModelWorker:
                 if self.strata_children:
                     raise GatewayError(503, "model_unload_failed", "A previous Strata engine is still releasing memory.")
             self._match_serving_plan()
+            if self.config.get("splash_project_cache_dir"):
+                from mlx_agent.splash_runtime import prepare_project_cache
+                try:
+                    prepare_project_cache(self.config["splash_project_cache_dir"])
+                except (OSError, ValueError) as error:
+                    raise GatewayError(503, "unsafe_splash_cache", str(error)) from error
             self._check_memory()
             self._launching_memory()
             private = self.config.get("private_worker")
@@ -1315,6 +1321,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             body = inference_defaults.apply(body, self.server.controller.request_defaults)
             self._measurement = self.server.controller.inference_telemetry.begin()
             port = self.server.controller.acquire(cancelled=self._client_gone)
+            self._measurement.mark_ready()
             leased = True
             connection = self.server.controller.connection(timeout=120)
             connection.connect()

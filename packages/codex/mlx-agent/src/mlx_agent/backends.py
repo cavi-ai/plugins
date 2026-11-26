@@ -20,7 +20,8 @@ MANIFEST_SCHEMA = "backend/1"
 INSTALL_MARKER = ".mlx-agent-backend.json"
 PORT_MARKER = ".mlx-agent-port.json"
 CATEGORIES = ("text_llm", "vision_language", "speech_to_text", "text_to_speech", "classification", "image_generation",
-              "video_generation", "music_generation", "mesh_generation", "embedding")
+              "video_generation", "music_generation", "mesh_generation", "image_segmentation", "source_separation",
+              "embedding")
 MAX_PROBE_FILES = 4000
 MAX_PROBE_FILE_BYTES = 1024 * 1024
 QUANTIZED_BITS = (2, 3, 4, 5, 6, 8)
@@ -39,6 +40,8 @@ TYPE_PREFERENCE = {
     "image_generation": ("mflux",),
     "video_generation": ("mlx-video",),
     "mesh_generation": ("mlx-3d",),
+    "image_segmentation": ("sam2",),
+    "source_separation": ("mlx-audio",),
 }
 DEFAULT_PREFERENCE = ("mlx-lm", "mlx-vlm", "mlx-audio")
 _ID = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
@@ -140,6 +143,16 @@ def _validate_manifest(value, path):
         isinstance(module, str) and _PORT.fullmatch(module) for module in converters.values()
     ):
         raise _invalid(path, "port_convert maps declared ports to a module inside the port")
+    inference_only = value.get("port_inference_only", [])
+    if not isinstance(inference_only, list) or not all(
+        isinstance(name, str) and name in ported and name not in converters for name in inference_only
+    ):
+        raise _invalid(path, "port_inference_only lists declared ports that cannot convert checkpoints")
+    prompted = value.get("port_prompted", [])
+    if not isinstance(prompted, list) or not all(
+        isinstance(name, str) and name in ports.get("source_separation", ()) for name in prompted
+    ):
+        raise _invalid(path, "port_prompted lists declared source-separation ports that separate a text prompt")
     pipelines = value.get("port_pipelines", {})
     if not isinstance(pipelines, dict) or not all(
         isinstance(name, str) and _PIPELINE.fullmatch(name) and port in ported for name, port in pipelines.items()
@@ -254,6 +267,17 @@ def port_converter(model_type, backend_id, manifests):
     if module is None or category is None:
         return None
     return "{0}.{1}".format(_module_path(manifest, category, name), module)
+
+
+def port_is_inference_only(model_type, backend_id, manifests):
+    manifest = manifests.get(backend_id) or {}
+    return normalize_type(model_type or "") in manifest.get("port_inference_only", ())
+
+
+def port_is_prompted(model_type, backend_id, manifests):
+    """Whether a separation port separates the sound a text prompt names instead of a fixed stem."""
+    manifest = manifests.get(backend_id) or {}
+    return normalize_type(model_type or "") in manifest.get("port_prompted", ())
 
 
 def port_bits(model_type, backend_id, manifests):
