@@ -131,12 +131,25 @@ _DEFAULT_ROOTS = (
 )
 
 
+_LMSTUDIO_DEFAULT_ROOTS = ("~/.cache/lm-studio/models", "~/.lmstudio/models")
+_LMSTUDIO_SETTINGS = "~/.lmstudio/settings.json"
+
+
+def lmstudio_roots():
+    """LM Studio model folders: its default locations and the downloads folder set in its settings."""
+    candidates = list(_LMSTUDIO_DEFAULT_ROOTS)
+    settings = _read_json_object(Path(_LMSTUDIO_SETTINGS).expanduser(), MAX_CONFIG_BYTES)
+    if settings and isinstance(settings.get("downloadsFolder"), str) and settings["downloadsFolder"]:
+        candidates.append(settings["downloadsFolder"])
+    return list(dict.fromkeys(str(Path(candidate).expanduser()) for candidate in candidates))
+
+
 def default_gguf_roots():
-    """Well-known local weight directories that exist on this host."""
+    """Well-known local weight directories that exist on this host, LM Studio's downloads folder included."""
     roots = []
-    for candidate in _DEFAULT_ROOTS:
+    for candidate in list(_DEFAULT_ROOTS) + lmstudio_roots():
         expanded = Path(candidate).expanduser()
-        if expanded.is_dir():
+        if expanded.is_dir() and str(expanded) not in roots:
             roots.append(str(expanded))
     return roots
 
@@ -652,7 +665,26 @@ def _component_weights(directory):
         isinstance(name, str) and name and "/" not in name and name not in (".", "..") for name in names
     ):
         return False
+    if value.get("model_type") == "qwen_image_21" and value.get("max_references") and "processor" in names:
+        # Earlier reference-enabled conversions listed the weightless image processor here.
+        if not Path(directory, "processor", "preprocessor_config.json").is_file():
+            return False
+        names = [name for name in names if name != "processor"]
+        if not names:
+            return False
     return all(any(Path(directory, name).glob("*.safetensors")) for name in names)
+
+
+def _mlx_output_markers(directory, filenames):
+    # Cache weight symlinks must still point to files.
+    if not any(name.endswith(".safetensors") and (directory / name).is_file() for name in filenames) \
+            and not _component_weights(directory):
+        return None
+    provenance = read_provenance(directory)
+    marker = _mlx_config(directory)
+    if provenance is None and marker is None and not _mlx_community_snapshot(directory):
+        return None
+    return provenance, marker
 
 
 def scan_mlx_outputs(roots, limit=MAX_SCAN_FILES, errors=None):
@@ -692,14 +724,10 @@ def scan_mlx_outputs(roots, limit=MAX_SCAN_FILES, errors=None):
                 if len(seen) >= limit:
                     return sorted(outputs, key=lambda item: item["path"])
                 continue
-            # is_file follows cache symlinks: a snapshot whose weight blobs are missing is not a model.
-            if not any(name.endswith(".safetensors") and (directory / name).is_file() for name in filenames) \
-                    and not _component_weights(directory):
+            markers = _mlx_output_markers(directory, filenames)
+            if markers is None:
                 continue
-            provenance = read_provenance(directory)
-            marker = _mlx_config(directory)
-            if provenance is None and marker is None and not _mlx_community_snapshot(directory):
-                continue
+            provenance, marker = markers
             try:
                 resolved = directory.resolve()
             except OSError:
@@ -745,15 +773,84 @@ def _output_matches(entry, output):
     return None
 
 
+def _attached_projector(output):
+    provenance = output.get("provenance") or {}
+    projector = (provenance.get("source") or {}).get("projector")
+    return projector if isinstance(projector, dict) else provenance.get("projector")
+
+
+def _projector_identity(projector):
+    signature = projector.get("signature")
+    if not isinstance(signature, str) or not signature:
+        signature = None
+    path = projector.get("path")
+    if isinstance(path, str) and path:
+        try:
+            return signature, Path(path).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            pass
+    return signature, None
+
+
+def _projector_matches(current, recorded):
+    signature, path = current
+    recorded_signature, recorded_path = recorded
+    if signature is not None and recorded_signature is not None:
+        return signature == recorded_signature
+    return path is not None and path == recorded_path
+
+
+def _projector_receipt_output(receipt):
+    out = receipt.get("out")
+    if not isinstance(out, str) or not out or receipt.get("exit_status") == "failed":
+        return None
+    try:
+        directory = Path(out).expanduser()
+        if (directory / "config.json").is_file() and _mlx_output_markers(directory, os.listdir(directory)) is not None:
+            return out
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return None
+
+
+def _pair_companion(entry, projector_outputs, projector_receipts):
+    """A projector is converted once its base model's conversion attached it to an output."""
+    identity = _projector_identity(entry)
+    matches = [out for projector, out in projector_outputs if _projector_matches(identity, projector)]
+    if matches:
+        evidence = "provenance"
+    else:
+        for projector, receipt in projector_receipts:
+            if _projector_matches(identity, projector):
+                out = _projector_receipt_output(receipt)
+                if out is not None:
+                    matches.append(out)
+        evidence = "receipt" if matches else "companion"
+    return dict(entry, status="converted" if matches else "companion", outputs=sorted(set(matches)), evidence=evidence)
+
+
 def pair_conversions(entries, outputs, receipts=()):
-    """Mark each GGUF as converted or pending, by provenance then by name."""
+    """Mark each GGUF as converted or pending, by provenance then by name.
+
+    Projectors pair with the output their base model's conversion attached them to; drafters no
+    port converts stay companions of their target instead of pending conversions.
+    """
     receipt_sources = {}
+    projector_receipts = []
     for receipt in receipts:
         source = receipt.get("source") or {}
+        projector = source.get("projector")
+        if isinstance(projector, dict):
+            projector_receipts.append((_projector_identity(projector), receipt))
         for key in ("signature", "path"):
             value = source.get(key)
             if isinstance(value, str) and value:
                 receipt_sources.setdefault(value, receipt)
+    projector_outputs = []
+    for output in outputs:
+        projector = _attached_projector(output)
+        if isinstance(projector, dict):
+            projector_outputs.append((_projector_identity(projector), output["path"]))
     paired = []
     for entry in entries:
         shard = entry.get("shard")
@@ -761,7 +858,7 @@ def pair_conversions(entries, outputs, receipts=()):
             paired.append(dict(entry, status="shard", outputs=[], evidence="shard"))
             continue
         if entry.get("companion"):
-            paired.append(dict(entry, status="companion", outputs=[], evidence="companion"))
+            paired.append(_pair_companion(entry, projector_outputs, projector_receipts))
             continue
         matches = []
         evidence = None
@@ -777,9 +874,13 @@ def pair_conversions(entries, outputs, receipts=()):
             if isinstance(out, str) and Path(out).is_dir():
                 matches.append(out)
                 evidence = "receipt"
+        status = "converted" if matches else "pending"
+        draft = entry.get("draft")
+        if not matches and draft is not None and draft.get("port") is None:
+            status, evidence = "companion", "drafter"
         paired.append(dict(
             entry,
-            status="converted" if matches else "pending",
+            status=status,
             outputs=sorted(set(matches)),
             evidence=evidence,
         ))
@@ -877,6 +978,11 @@ def _mlx_name_key(name, sizes=False):
 
 def _mlx_model_key(directory):
     return _mlx_name_key(_mlx_name(directory))
+
+
+def name_key(repo):
+    """The model key a repository shares with its local copies: format and quantization labels removed."""
+    return _mlx_name_key(str(repo).rsplit("/", 1)[-1])
 
 
 def _read_json_object(location, limit):

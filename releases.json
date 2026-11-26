@@ -1,7 +1,7 @@
 {
   "mlx-agent": {
-    "tag": "v0.16.0",
-    "commit": "854341a6ce44a0b09dea2dbf012b411919de9847"
+    "tag": "v0.17.0",
+    "commit": "26e35745620679c60ae70b017213717f63e03252"
   },
   "obsidian-agent": {
     "tag": "v0.3.0",

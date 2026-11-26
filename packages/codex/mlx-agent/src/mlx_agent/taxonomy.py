@@ -15,7 +15,7 @@ from .modality import detect_facets, detect_modalities
 
 TASK_TYPES = (
     "text_llm", "vision_language", "speech_to_text", "text_to_speech",
-    "embedding", "classification", "image_generation", "video_generation", "mesh_generation", "music_generation", "speculative_draft", "vision_projector", "other",
+    "embedding", "classification", "image_generation", "image_segmentation", "source_separation", "video_generation", "mesh_generation", "music_generation", "speculative_draft", "vision_projector", "other",
 )
 # Ordered specific-first; the last entry is the type's default use case.
 USE_CASES = {
@@ -26,6 +26,8 @@ USE_CASES = {
     "embedding": ("reranking", "retrieval"),
     "classification": ("moderation", "routing", "classification"),
     "image_generation": ("image_generation",),
+    "image_segmentation": ("image_segmentation",),
+    "source_separation": ("source_separation",),
     "video_generation": ("video_generation",),
     "mesh_generation": ("mesh_generation",),
     "music_generation": ("music_generation",),
@@ -51,10 +53,12 @@ PIPELINE_TYPES = {
     "text-ranking": "embedding",
     "text-classification": "classification",
     "zero-shot-classification": "classification",
+    "token-classification": "classification",
     "text-to-image": "image_generation",
     "image-to-image": "image_generation",
     "text-to-video": "video_generation",
     "image-to-3d": "mesh_generation",
+    "text-to-3d": "mesh_generation",
 }
 _SPECIFIC_TOKENS = (
     ("coding", ("code", "coder", "coding", "starcoder", "codestral", "devstral")),
@@ -117,6 +121,10 @@ def _type_from_hits(hits, config_keys, haystack, vision_module=False, allow_visi
         return "classification"
     if "image_generation" in categories:
         return "image_generation"
+    if "image_segmentation" in categories:
+        return "image_segmentation"
+    if "source_separation" in categories:
+        return "source_separation"
     if "mesh_generation" in categories:
         return "mesh_generation"
     if "video_generation" in categories:
@@ -218,7 +226,7 @@ def read_config_type(directory):
 
 
 def annotate_inventory(report, manifests=None, registries=None):
-    """Add a "task" object to every scanned GGUF model and MLX output."""
+    """Add a "task" object to every scanned GGUF model, MLX output and Ollama model."""
     if manifests is None:
         try:
             manifests = load_manifests()
@@ -249,6 +257,14 @@ def annotate_inventory(report, manifests=None, registries=None):
             backend = output_backend(model_type, keys, output["task"]["type"], manifests, registries)
             if backend is not None:
                 output["backend"] = backend
+    for model in report.get("ollama", []):
+        # An Ollama GGUF names a llama.cpp architecture; a safetensors import names its config model_type.
+        gguf_format = model.get("format") == "gguf"
+        model["task"] = classify(
+            model.get("name"), model_type=None if gguf_format else model.get("architecture"),
+            gguf_architecture=model.get("architecture") if gguf_format else None,
+            manifests=manifests, registries=registries, local=True, draft=model.get("draft") is not None,
+        )
     return report
 
 

@@ -17,7 +17,8 @@ from .describe import plan_describe, run_describe
 from .generate import plan_generate, run_generate
 from .inference_runner import InferenceError
 from .music import plan_music, run_music, validate_parameters as validate_music
-from .mesh import MeshError, plan_mesh, run_mesh, validate_glb
+from .mesh import MeshError, plan_mesh, run_mesh, validate_bbox, validate_glb
+from .segment import plan_segment, run_segment
 from .speak import plan_speak, run_speak
 from .task_contracts import (MEDIA_REQUEST_SCHEMA, MEDIA_RUN_SCHEMA, REQUEST_SCHEMA, RUN_SCHEMA, TaskError,
                              absolute_path, encoded, finite_number)
@@ -129,12 +130,13 @@ def _validate_classification(parameters):
 
 
 def _validate_music(parameters):
-    allowed = {"caption", "lyrics", "duration", "steps", "seed", "bpm", "time_signature", "reference"}
+    allowed = {"caption", "lyrics", "duration", "steps", "seed", "bpm", "time_signature", "reference", "key", "keep_caption"}
     if "caption" not in parameters or set(parameters) - allowed:
         raise _invalid("Music parameters need a caption and supported generation settings.")
     return validate_music(parameters["caption"], parameters.get("lyrics", "[instrumental]"),
                           parameters.get("duration", 15.0), parameters.get("steps", 30), parameters.get("seed", 42),
-                          parameters.get("bpm"), parameters.get("time_signature"), parameters.get("reference"))
+                          parameters.get("bpm"), parameters.get("time_signature"), parameters.get("reference"),
+                          parameters.get("key"), parameters.get("keep_caption", False))
 
 
 def _validate_transcribe(parameters):
@@ -159,6 +161,24 @@ def _validate_image_generation(parameters):
                   "Image-generation parameters need prompt and optional size, steps and seed.")
     _require_string(parameters, "prompt")
     _require_integer(parameters, "width", "height", "steps", "seed")
+    return parameters
+
+
+def _validate_segmentation(parameters):
+    _require_keys(parameters, ('image_path', 'box', 'mask_threshold'), ('points', 'labels'),
+                  'Segmentation requires image_path, box and mask_threshold.')
+    _require_absolute(parameters, 'image_path')
+    box = parameters['box']
+    if not isinstance(box, list) or len(box) != 4 or any(type(n) is not int for n in box):
+        raise _invalid('box must contain four integer pixel coordinates.')
+    if box[0] < 0 or box[1] < 0 or box[0] >= box[2] or box[1] >= box[3]:
+        raise _invalid('box must be a nonempty positive pixel rectangle.')
+    points, labels = parameters.get('points', []), parameters.get('labels', [])
+    if (not isinstance(points, list) or not isinstance(labels, list) or len(points) != len(labels)
+            or any(not isinstance(p, list) or len(p) != 2 or any(type(n) is not int or n < 0 for n in p) for p in points)
+            or any(type(label) is not int or label not in (0, 1) for label in labels)):
+        raise _invalid('points and binary labels must be paired.')
+    _require_finite(parameters, 'mask_threshold')
     return parameters
 
 
@@ -203,7 +223,7 @@ def _validate_video_understanding(parameters):
 
 
 def _validate_mesh(parameters):
-    _require_keys(parameters, ("image_path",), ("steps", "seed", "resolution", "guidance", "max_faces", "denoiser_cache", "cache_memory_mib", "views", "guide"),
+    _require_keys(parameters, ("image_path",), ("steps", "seed", "resolution", "guidance", "max_faces", "denoiser_cache", "cache_memory_mib", "views", "guide", "bbox"),
                   "Mesh-generation parameters need image_path and supported generation settings.")
     _require_absolute(parameters, "image_path")
     _require_integer(parameters, "steps", "seed", "resolution", "max_faces", "cache_memory_mib")
@@ -216,6 +236,13 @@ def _validate_mesh(parameters):
     _require_finite(parameters, "guidance")
     if "guide" in parameters:
         _require_absolute(parameters, "guide")
+    if "bbox" in parameters:
+        if not isinstance(parameters["bbox"], list):
+            raise _invalid("bbox must be a list of three sizes.")
+        try:
+            validate_bbox(parameters["bbox"], parameters.get("guide"))
+        except ValueError as error:
+            raise _invalid(str(error)) from error
     if "views" in parameters and (not isinstance(parameters["views"], list)
                                   or any(not absolute_path(path) for path in parameters["views"])):
         raise _invalid("views must be an ordered list of absolute local paths.")
@@ -240,7 +267,8 @@ def _plan_music(model, parameters, output, media, directory):
     return plan_music(model, parameters["caption"], parameters["lyrics"], output,
                       duration=parameters["duration"], steps=parameters["steps"], seed=parameters["seed"],
                       bpm=parameters.get("bpm"), time_signature=parameters.get("time_signature"),
-                      reference=parameters.get("reference"))
+                      reference=parameters.get("reference"), key=parameters.get("key"),
+                      keep_caption=parameters.get("keep_caption", False))
 
 
 def _plan_transcribe(model, parameters, output, media, directory):
@@ -272,7 +300,7 @@ def _plan_video_understanding(model, parameters, output, media, directory):
 
 
 def _plan_mesh(model, parameters, output, media, directory):
-    return plan_mesh(model, media, output, **_options(parameters, ("steps", "seed", "resolution", "guidance", "max_faces", "denoiser_cache", "cache_memory_mib", "views", "guide")))
+    return plan_mesh(model, media, output, **_options(parameters, ("steps", "seed", "resolution", "guidance", "max_faces", "denoiser_cache", "cache_memory_mib", "views", "guide", "bbox")))
 
 
 def _check_mesh_output(path, plan):
@@ -329,6 +357,9 @@ check_mp4 = _backend_validator("task_mp4_validator.py", "invalid_video_output",
 
 
 KINDS: Dict[str, TaskKind] = {kind.name: kind for kind in (
+    TaskKind('image_segmentation', 'segment/1', False, _validate_segmentation, plan_segment,
+             lambda plan, **options: run_segment(plan, **options), input_field='image_path', input_media='image',
+             output='output.png', output_check=lambda path, plan: check_png(path, plan)),
     TaskKind("embedding", "embed/1", False, validate_embedding, _plan_embedding, lambda plan, **options: run_embed(plan, **options)),
     TaskKind("classification", "decide/1", True, _validate_classification, _plan_classification,
              lambda plan, **options: run_decide(plan, **options)),

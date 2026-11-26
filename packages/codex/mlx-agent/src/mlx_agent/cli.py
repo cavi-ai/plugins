@@ -124,6 +124,15 @@ def _add_discovery_arguments(parser):
                         help="rank each role by this Hugging Face order (newest: reputable publishers only)")
     parser.add_argument("--search", help="match repository names on Hugging Face")
     parser.add_argument("--fast", action="store_true", help="skip per-model enrichment (name heuristics only)")
+    parser.add_argument("--local-status", action="store_true",
+                        help="mark each candidate with its local copies (exact, variant or absent)")
+    parser.add_argument("--exclude-local", action="store_true",
+                        help="leave out models present locally in any version before ranking (implies --local-status)")
+    parser.add_argument("--gguf-root", action="append", default=None, dest="gguf_roots",
+                        help="local model folder read for local status (repeatable; well-known folders by default)")
+    parser.add_argument("--mlx-root", action="append", default=None, dest="mlx_roots",
+                        help="MLX model folder read for local status (repeatable; defaults to the GGUF roots)")
+    parser.add_argument("--receipts-dir", default=None, help="conversion receipts read for local status")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--wire", metavar="REPO", help="emit setup + config for a model, instead of discovering")
     parser.add_argument("--target", choices=["ollama", "lmstudio", "mlx_lm", "mlx-vlm", "litellm", "openclaw"], default="mlx_lm")
@@ -151,6 +160,18 @@ def _run_discovery(arguments, legacy):
             error = result.to_dict()["error"]
             print("discover failed [{0}]: {1}\nremediation: {2}".format(error["code"], error["message"], error["remediation"]))
         return 2
+    local_models = None
+    if arguments.local_status or arguments.exclude_local:
+        from .convert import ConvertError
+        from .local_status import scan
+        try:
+            local_models = scan(_scan_roots(arguments, allow_empty=True), mlx_roots=arguments.mlx_roots or (),
+                                receipts=_scan_receipts(arguments), signature=False)["local_models"]
+        except ConvertError as error:
+            result = ResultEnvelope.fail("discover", error.code, str(error), error.remediation)
+            print(json.dumps(result.to_dict(), indent=2) if arguments.json else "discover failed [{0}]: {1}\nremediation: {2}".format(
+                error.code, error, error.remediation))
+            return 2
     service, fixture_warning, fixture_error = _discovery_service_from_environment(arguments.state_dir)
     result = fixture_error or service.discover(DiscoveryRequest(
         role=arguments.role,
@@ -168,6 +189,8 @@ def _run_discovery(arguments, legacy):
         context_tokens=arguments.context_tokens,
         sort=arguments.sort,
         search=arguments.search,
+        local_models=local_models,
+        exclude_local=arguments.exclude_local,
     ))
     if fixture_warning:
         result = ResultEnvelope.ok("discover", result.data, warnings=[fixture_warning])
@@ -1115,6 +1138,8 @@ def _add_splash_tuning_arguments(parser):
                         help="thinking tokens of a request that sets no budget (0–1010000)")
     parser.add_argument("--splash-persistent-cache", action=argparse.BooleanOptionalAction, default=None,
                         help="keep Splash's SSD prompt cache across restarts")
+    parser.add_argument("--splash-project-cache", help="named project SSD prompt cache")
+    parser.add_argument("--splash-max-cache-disk-writes-gb", type=float, help="project cache write cap in decimal GB")
     parser.add_argument("--splash-max-cache-disk-gb", type=float,
                         help="SSD prompt cache quota in decimal GB (0 turns the cache off; default: Splash's own)")
 
@@ -2163,8 +2188,21 @@ def _add_convert_arguments(parser):
     transcribe.add_argument("--path", required=True, help="converted speech model directory")
     transcribe.add_argument("--audio", required=True, help="audio file (WAV, FLAC, MP3)")
     transcribe.add_argument("--language", default=None, help="language code passed to models that take one")
+    transcribe.add_argument("--words", action="store_true", help="also return each word's start and end seconds (Whisper models)")
     transcribe.add_argument("--timeout", type=int, default=300, help="seconds before the backend run is stopped")
     transcribe.add_argument("--json", action="store_true")
+    separate = actions.add_parser(
+        "separate",
+        help="split one audio mix into a stem and the rest with a source-separation model",
+    )
+    separate.add_argument("--path", required=True, help="source-separation model directory")
+    separate.add_argument("--audio", required=True, help="audio mix (WAV, FLAC, MP3)")
+    separate.add_argument("--out", required=True, help="new absolute .wav path for the stem")
+    separate.add_argument("--rest", default=None, help="new absolute .wav path for the mix minus the stem")
+    separate.add_argument("--prompt", default=None,
+                          help="the sound to separate, such as drums (text-prompted models such as SAM-Audio)")
+    separate.add_argument("--timeout", type=int, default=1800, help="seconds before the backend run is stopped")
+    separate.add_argument("--json", action="store_true")
     decide = actions.add_parser(
         "decide",
         help="answer typed questions about a state with a converted classification model (read-only verification canary)",
@@ -2184,6 +2222,8 @@ def _add_convert_arguments(parser):
     generate.add_argument("--height", type=int, default=1024)
     generate.add_argument("--steps", type=int, default=40)
     generate.add_argument("--seed", type=int, default=42)
+    generate.add_argument("--image", action="append", default=[],
+                          help="absolute reference still the render keeps consistent with (repeatable, up to the model's limit)")
     generate.add_argument("--timeout", type=int, default=1800, help="seconds before the backend run is stopped")
     generate.add_argument("--json", action="store_true")
     music = actions.add_parser("music", help="generate music from an existing local music model")
@@ -2197,8 +2237,24 @@ def _add_convert_arguments(parser):
     music.add_argument("--bpm", type=int, help="tempo for ACE-Step models (30..300)")
     music.add_argument("--time-signature", type=int, help="beats per bar for ACE-Step models: 2, 3, 4 or 6")
     music.add_argument("--reference", help="absolute audio file whose style ACE-Step models follow")
+    music.add_argument("--key", help='musical key for ACE-Step models, such as "F# minor"')
+    music.add_argument("--keep-caption", action="store_true",
+                       help="send the caption to ACE-Step as written instead of the planner's rewrite")
     music.add_argument("--timeout", type=int, default=3600)
     music.add_argument("--json", action="store_true")
+    compose = actions.add_parser(
+        "compose", help="plan a song with the ACE-Step planner beside a music model: caption, lyrics, tempo and key (read-only)")
+    compose.add_argument("--path", required=True, help="ACE-Step checkpoint directory with the planner beside it")
+    compose.add_argument("--caption", required=True, help="style, instruments, mood and vocals (1..2000 characters)")
+    compose.add_argument("--lyrics", required=True, help="lyrics under [section] tags, or [instrumental]")
+    compose.add_argument("--bpm", type=int, help="tempo the plan keeps (30..300)")
+    compose.add_argument("--duration", type=float, help="whole seconds the plan keeps (1..360)")
+    compose.add_argument("--key", help='key the plan keeps, such as "F# minor"')
+    compose.add_argument("--time-signature", type=int, help="beats per bar the plan keeps: 2, 3, 4 or 6")
+    compose.add_argument("--language", help="vocal language code the plan keeps, such as en")
+    compose.add_argument("--temperature", type=float, default=0.85, help="planner sampling temperature (0..2)")
+    compose.add_argument("--timeout", type=int, default=900, help="seconds before the backend run is stopped")
+    compose.add_argument("--json", action="store_true")
     speak = actions.add_parser(
         "speak",
         help="synthesize one text with a converted text-to-speech model to a new WAV (read-only verification canary)",
@@ -2213,10 +2269,10 @@ def _add_convert_arguments(parser):
     speak.add_argument("--json", action="store_true")
     describe = actions.add_parser(
         "describe",
-        help="answer one question about an image or a video with a converted vision-language model (read-only verification canary)",
+        help="answer one prompt, about an image, a video or neither, with a converted vision-language model (read-only)",
     )
     describe.add_argument("--path", required=True, help="converted vision-language model directory")
-    describe.add_argument("--prompt", required=True, help="question about the media (1..4000 characters)")
+    describe.add_argument("--prompt", required=True, help="question about the media, or a text prompt (1..16000 characters)")
     describe.add_argument("--image", default=None, help="image file (png, jpg, jpeg, webp)")
     describe.add_argument("--video", default=None, help="video file (mp4, mov, m4v)")
     describe.add_argument("--max-tokens", type=int, default=256, help="answer length limit (1..4096)")
@@ -2244,6 +2300,9 @@ def _add_convert_arguments(parser):
                       help="TRELLIS.2: another image of the object, conditioning sampler steps in turn; repeatable")
     mesh.add_argument("--guide", default=None,
                       help="TRELLIS.2: a GLB whose surface voxels replace the sampled sparse structure")
+    mesh.add_argument("--bbox", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"),
+                      help="TRELLIS.2: sizes with z up; the sampled shape takes their proportions and the mesh "
+                           "their size")
     mesh.add_argument("--timeout", type=int, default=3600)
     mesh.add_argument("--json", action="store_true")
     video = actions.add_parser(
@@ -2280,6 +2339,8 @@ def _run_convert(arguments):
     from .gguf import GGUFError
     from .inference_runner import InferenceError
     from .music import plan_music, run_music
+    from .compose import plan_compose, run_compose
+    from .separate import plan_separate, run_separate
     from .serve import default_model_present
     from .speak import plan_speak, run_speak
     from .transcribe import plan_transcribe, run_transcribe
@@ -2308,11 +2369,25 @@ def _run_convert(arguments):
         if arguments.convert_command == "transcribe":
             if not 1 <= arguments.timeout <= 3600:
                 raise ValueError("--timeout must be 1..3600 seconds")
-            plan = plan_transcribe(arguments.path, arguments.audio, language=arguments.language)
+            plan = plan_transcribe(arguments.path, arguments.audio, language=arguments.language, words=arguments.words)
             from .compute import guarded_start
             result = guarded_start("transcribe", run_transcribe, plan, timeout=arguments.timeout)
+            human = result["text"]
+            if arguments.words and not arguments.json:
+                lines = ["{start:.3f}s - {end:.3f}s  {word}".format(**word) for word in result["words"]]
+                human = "\n".join(([human] if human else []) + lines)
             return _emit_serve_result(
-                ResultEnvelope.ok(operation, result), arguments.json, human=result["text"],
+                ResultEnvelope.ok(operation, result), arguments.json, human=human,
+            )
+        if arguments.convert_command == "separate":
+            if not 1 <= arguments.timeout <= 7200:
+                raise ValueError("--timeout must be 1..7200 seconds")
+            plan = plan_separate(arguments.path, arguments.audio, arguments.out, rest=arguments.rest,
+                                 prompt=arguments.prompt)
+            from .compute import guarded_start
+            result = guarded_start("separate", run_separate, plan, timeout=arguments.timeout)
+            return _emit_serve_result(
+                ResultEnvelope.ok(operation, result), arguments.json, human=result["path"],
             )
         if arguments.convert_command == "decide":
             if not 1 <= arguments.timeout <= 3600:
@@ -2326,17 +2401,34 @@ def _run_convert(arguments):
             if not 1 <= arguments.timeout <= 7200:
                 raise ValueError("--timeout must be 1..7200 seconds")
             plan = plan_generate(arguments.path, arguments.prompt, arguments.out, width=arguments.width,
-                                 height=arguments.height, steps=arguments.steps, seed=arguments.seed)
-            result = served_or_local("generate", run_generate, plan, arguments.out)
+                                 height=arguments.height, steps=arguments.steps, seed=arguments.seed,
+                                 images=arguments.image)
+            if arguments.image:
+                # Served endpoints take no reference images, so a referenced render runs in its own process.
+                from .compute import guarded_start
+                result = guarded_start("generate", run_generate, plan, timeout=arguments.timeout)
+            else:
+                result = served_or_local("generate", run_generate, plan, arguments.out)
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["path"])
         if arguments.convert_command == "music":
             if not 1 <= arguments.timeout <= 14400:
                 raise ValueError("--timeout must be 1..14400 seconds")
             plan = plan_music(arguments.path, arguments.caption, arguments.lyrics, arguments.out,
                               duration=arguments.duration, steps=arguments.steps, seed=arguments.seed,
-                              bpm=arguments.bpm, time_signature=arguments.time_signature, reference=arguments.reference)
+                              bpm=arguments.bpm, time_signature=arguments.time_signature, reference=arguments.reference,
+                              key=arguments.key, keep_caption=arguments.keep_caption)
             result = served_or_local("music", run_music, plan, arguments.out)
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["path"])
+        if arguments.convert_command == "compose":
+            if not 1 <= arguments.timeout <= 3600:
+                raise ValueError("--timeout must be 1..3600 seconds")
+            plan = plan_compose(arguments.path, arguments.caption, arguments.lyrics, bpm=arguments.bpm,
+                                duration=arguments.duration, key=arguments.key,
+                                time_signature=arguments.time_signature, language=arguments.language,
+                                temperature=arguments.temperature)
+            from .compute import guarded_start
+            result = guarded_start("compose", run_compose, plan, timeout=arguments.timeout)
+            return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["caption"])
         if arguments.convert_command == "speak":
             if not 1 <= arguments.timeout <= 7200:
                 raise ValueError("--timeout must be 1..7200 seconds")
@@ -2350,7 +2442,12 @@ def _run_convert(arguments):
             plan = plan_describe(arguments.path, arguments.prompt, image=arguments.image, video=arguments.video,
                                  max_tokens=arguments.max_tokens, temperature=arguments.temperature,
                                  fps=arguments.fps, max_pixels=arguments.max_pixels)
-            result = served_or_local("describe", run_describe, plan, None)
+            if plan["input"]["kind"] == "text":
+                # Served endpoints take image and video tasks; a text prompt runs locally.
+                from .compute import guarded_start
+                result = guarded_start("describe", run_describe, plan, timeout=arguments.timeout)
+            else:
+                result = served_or_local("describe", run_describe, plan, None)
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["text"])
         if arguments.convert_command == "mesh":
             if not 1 <= arguments.timeout <= 14400:
@@ -2359,7 +2456,7 @@ def _run_convert(arguments):
                              seed=arguments.seed, resolution=arguments.resolution, guidance=arguments.guidance,
                              max_faces=arguments.max_faces, denoiser_cache=arguments.denoiser_cache,
                              cache_memory_mib=arguments.cache_memory_mib, views=arguments.view,
-                             guide=arguments.guide)
+                             guide=arguments.guide, bbox=arguments.bbox)
             result = served_or_local("mesh", run_mesh, plan, arguments.out)
             return _emit_serve_result(ResultEnvelope.ok(operation, result), arguments.json, human=result["path"])
         if arguments.convert_command == "video":
@@ -2453,21 +2550,12 @@ def _run_convert(arguments):
 
 
 def _convert_scan(arguments):
-    from .convert import ConvertError, load_receipts
-    from .gguf import MAX_SCAN_FILES, default_gguf_roots, families, inventory
-    from .taxonomy import annotate_inventory
-    roots = arguments.gguf_roots if arguments.gguf_roots is not None else (
-        [] if arguments.mlx_roots is not None else default_gguf_roots())
-    if not roots and not arguments.mlx_roots:
-        raise ConvertError(
-            "no_scan_roots",
-            "No model roots were given and none of the well-known GGUF directories exist.",
-            "Pass --gguf-root PATH or --mlx-root PATH for each model directory.",
-        )
-    report = inventory(
-        roots,
+    from .gguf import MAX_SCAN_FILES
+    from .local_status import scan
+    report = scan(
+        _scan_roots(arguments),
         mlx_roots=arguments.mlx_roots or (),
-        receipts=load_receipts(arguments.receipts_dir),
+        receipts=_scan_receipts(arguments),
         signature=not arguments.no_signature,
         limit=arguments.limit or MAX_SCAN_FILES,
         compare_assets=arguments.compare_assets,
@@ -2478,12 +2566,27 @@ def _convert_scan(arguments):
             item for item in report["models"] if item["status"] == "pending"
         ])
     from .splash_runtime import annotate_support
-    report = annotate_inventory(report)
     annotate_support(report["outputs"])
-    task_types = {item["path"]: item["task"].get("type") for item in report["models"] + report["outputs"]
-                  if isinstance(item.get("task"), dict)}
-    report["families"] = families(report["storage"]["items"], task_types)
     return report
+
+
+def _scan_roots(arguments, *, allow_empty=False):
+    from .convert import ConvertError
+    from .gguf import default_gguf_roots
+    roots = arguments.gguf_roots if arguments.gguf_roots is not None else (
+        [] if arguments.mlx_roots is not None else default_gguf_roots())
+    if not allow_empty and not roots and not arguments.mlx_roots:
+        raise ConvertError(
+            "no_scan_roots",
+            "No model roots were given and none of the well-known GGUF directories exist.",
+            "Pass --gguf-root PATH or --mlx-root PATH for each model directory.",
+        )
+    return roots
+
+
+def _scan_receipts(arguments):
+    from .convert import load_receipts
+    return load_receipts(arguments.receipts_dir)
 
 
 def _human_bytes(count):
